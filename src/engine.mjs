@@ -14,7 +14,7 @@ export function plan(seed, count) {
     stepsPerOperation: Array.from({ length: 12 }, () => integer(random, 1, 3)),
     dataPerStep: Array.from({ length: 36 }, () => integer(random, 1, 4)),
     units: integer(random, 1, 8),
-    invalidNumeric: integer(random, 1, 3),
+    invalidNumeric: 1,
   }));
 }
 export class Api {
