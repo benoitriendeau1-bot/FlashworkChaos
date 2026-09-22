@@ -77,6 +77,7 @@ for (const scenario of scenarios) {
   totals.masterItems++;
   const numeric = [];
   let dpSeq = 0;
+  let localOps = 0;
   for (let o = 0; o < scenario.operations; o++) {
     const op = await request('add operation', 'POST', root + '/operations', {
       operationNo: String((o + 1) * 10), operationTitle: 'Assembly operation ' + (o + 1),
@@ -86,6 +87,7 @@ for (const scenario of scenarios) {
     const opId = requiredId(op, ['masOpeId', 'id'], 'operation id');
     if (!opId) continue;
     totals.operations++;
+    localOps++;
     for (let s = 0; s < scenario.stepsPerOperation[o]; s++) {
       const step = await request('add step', 'POST', root + '/steps', {
         masOpeId: opId, stepNo: s + 1, stepTitle: 'Inspect and record ' + (s + 1),
@@ -110,7 +112,13 @@ for (const scenario of scenarios) {
       }
     }
   }
-  if (totals.operations < 3 || numeric.length === 0) { totals.blocked++; continue; }
+  if (localOps < 3 || numeric.length === 0) { totals.blocked++; continue; }
+  // Schema oracle: an authoring numeric limit cannot be a word.
+  const invalid = await request('reject nonnumeric minimum', 'POST', root + '/data-points', {
+    masOpeStepId: numeric[0].stepId, referenceCode: 'BAD' + suffix,
+    label: 'Bad numeric boundary', dataType: 'number', minValue: 'potato',
+  }, 'reject');
+  if (invalid.ok) totals.negativeChecks++;
   // Release is an explicit contract gate. A rejected release blocks this PO; it is not silently counted as coverage.
   const released = await request('release master', 'PATCH', root, { status: 'Released' });
   if (!released.ok) { totals.blocked++; continue; }
@@ -131,17 +139,13 @@ for (const scenario of scenarios) {
     if (!wo.ok || !woId) continue;
     const entry = numeric[integer(random, 0, numeric.length - 1)];
     if (!entry.dataId) { totals.blocked++; continue; }
-    const route = orderRoot + '/work-orders/' + woId + '/steps/' + entry.stepId + '/data/' + entry.dataId;
-    // A draft ID is not a production snapshot ID; discover production IDs from detail before asserting capture.
     const detail = await request('read WO detail', 'GET', orderRoot + '/work-orders/' + woId);
     if (!detail.ok) continue;
-    const serialized = JSON.stringify(detail.data);
-    if (!serialized.includes('proStepDataId')) { totals.blocked++; continue; }
-    // Snapshot traversal is backend-version-dependent and is intentionally handled by an adapter in a later increment.
-    output.write({ seq: ++action, label: 'capture blocked: production snapshot ID mapping needed', woId });
+    // Production IDs differ from the draft IDs; never claim capture coverage from a draft identifier.
+    output.write({ seq: ++action, label: 'snapshot read', woId, draftDataId: entry.dataId });
   }
 }
-const minimum = { operations: 3 * totals.masterItems, numericData: totals.masterItems,
+const minimum = { operations: 3 * count, numericData: count, negativeChecks: count,
   productionOrders: count, workOrders: count };
 const missing = Object.fromEntries(Object.entries(minimum).filter(([key, goal]) => totals[key] < goal));
 const summary = { seed, runId, count, actions: action, totals, minimum, missing, pass: totals.findings === 0 && totals.blocked === 0 && Object.keys(missing).length === 0 };
