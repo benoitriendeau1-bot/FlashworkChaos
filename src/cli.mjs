@@ -1,4 +1,4 @@
-import { Api, plan, integer, rng, identifier, reportWriter } from './engine.mjs';
+import { Api, plan, integer, rng, identifier, reportWriter, stepsAfterSeededOperation, pickReleasableSignoffRequirement, signoffForRelease } from './engine.mjs';
 import path from 'node:path';
 
 const arg = (name, fallback) => {
@@ -64,6 +64,12 @@ function requiredId(result, keys, label) {
 }
 const prefix = arg('prefix', 'CH');
 if (!/^[A-Z]{2,5}$/.test(prefix)) throw new Error('prefix must be 2–5 uppercase letters');
+const catalogue = await request('list sign-off requirements', 'GET', '/sign-off-requirements?activeOnly=true');
+const signoffRequirement = catalogue.ok ? pickReleasableSignoffRequirement(catalogue.data) : null;
+if (!signoffRequirement) {
+  totals.blocked++;
+  output.write({ seq: ++action, label: 'BLOCKED sign-off requirement', response: catalogue.data });
+}
 for (const scenario of scenarios) {
   const suffix = String(scenario.index).padStart(4, '0');
   const mi = 'MI-' + prefix + runId.replaceAll('-', '').slice(0, 12).toUpperCase() + suffix;
@@ -78,41 +84,58 @@ for (const scenario of scenarios) {
   const numeric = [];
   let dpSeq = 0;
   let localOps = 0;
+  let publishable = Boolean(signoffRequirement);
+  async function addDataPoints(stepId, slots) {
+    for (let d = 0; d < (slots ?? 0); d++) {
+      const type = (dpSeq++ % 3 === 0) ? 'text' : 'number';
+      const body = { masOpeStepId: stepId, referenceCode: 'D' + String(dpSeq).padStart(4, '0'),
+        label: type === 'number' ? 'Measured dimension ' + dpSeq : 'Inspection note ' + dpSeq,
+        dataType: type, isMandatory: false };
+      if (type === 'number') Object.assign(body, { minValue: 0, maxValue: 100, nominalValue: 50, unit: 'mm' });
+      const point = await request('add data point', 'POST', root + '/data-points', body);
+      if (point.ok) {
+        totals[type === 'number' ? 'numericData' : 'textData']++;
+        if (type === 'number') numeric.push({ stepId, dataId: identifier(point.data, ['masStepDataId', 'id']) });
+      } else totals.blocked++;
+    }
+  }
   for (let o = 0; o < scenario.operations; o++) {
     const op = await request('add operation', 'POST', root + '/operations', {
       operationNo: String((o + 1) * 10), operationTitle: 'Assembly operation ' + (o + 1),
       mustCompleteBeforeLater: o % 3 !== 0,
     });
-    if (!op.ok) { totals.blocked++; continue; }
+    if (!op.ok) { totals.blocked++; publishable = false; continue; }
     const opId = requiredId(op, ['masOpeId', 'id'], 'operation id');
-    if (!opId) continue;
+    if (!opId) { publishable = false; continue; }
     totals.operations++;
     localOps++;
-    for (let s = 0; s < scenario.stepsPerOperation[o]; s++) {
+    // The create response already contains step 1. Reuse it; further steps start at 2.
+    const authored = stepsAfterSeededOperation(op.data, scenario.stepsPerOperation[o]);
+    if (!authored.seeded) { totals.blocked++; publishable = false; continue; }
+    const named = await request('name seeded step', 'PATCH', root + '/steps/' + authored.seeded.masOpeStepId, authored.name);
+    if (!named.ok) { totals.blocked++; publishable = false; }
+    totals.steps++;
+    const stepIds = [authored.seeded.masOpeStepId];
+    await addDataPoints(authored.seeded.masOpeStepId, scenario.dataPerStep[o * 3]);
+    for (let s = 0; s < authored.creates.length; s++) {
+      const spec = authored.creates[s];
       const step = await request('add step', 'POST', root + '/steps', {
-        masOpeId: opId, stepNo: s + 1, stepTitle: 'Inspect and record ' + (s + 1),
-        toolsFirst: false,
+        masOpeId: opId, stepNo: spec.stepNo, stepTitle: spec.stepTitle, toolsFirst: spec.toolsFirst,
       });
-      if (!step.ok) { totals.blocked++; continue; }
+      if (!step.ok) { totals.blocked++; publishable = false; continue; }
       const stepId = requiredId(step, ['masOpeStepId', 'id'], 'step id');
-      if (!stepId) continue;
+      if (!stepId) { publishable = false; continue; }
       totals.steps++;
-      const slots = scenario.dataPerStep[o * 3 + s];
-      for (let d = 0; d < slots; d++) {
-        const type = (dpSeq++ % 3 === 0) ? 'text' : 'number';
-        const body = { masOpeStepId: stepId, referenceCode: 'D' + String(dpSeq).padStart(4, '0'),
-          label: type === 'number' ? 'Measured dimension ' + dpSeq : 'Inspection note ' + dpSeq,
-          dataType: type, isMandatory: false };
-        if (type === 'number') Object.assign(body, { minValue: 0, maxValue: 100, nominalValue: 50, unit: 'mm' });
-        const point = await request('add data point', 'POST', root + '/data-points', body);
-        if (point.ok) {
-          totals[type === 'number' ? 'numericData' : 'textData']++;
-          if (type === 'number') numeric.push({ stepId, dataId: identifier(point.data, ['masStepDataId', 'id']) });
-        } else totals.blocked++;
-      }
+      stepIds.push(stepId);
+      await addDataPoints(stepId, scenario.dataPerStep[o * 3 + s + 1]);
+    }
+    if (!signoffRequirement) continue;
+    for (const stepId of stepIds) {
+      const sign = await request('add sign-off', 'POST', root + '/signoffs', signoffForRelease(stepId, signoffRequirement));
+      if (!sign.ok) { totals.blocked++; publishable = false; }
     }
   }
-  if (localOps < 3 || numeric.length === 0) { totals.blocked++; continue; }
+  if (localOps < 3 || numeric.length === 0 || !publishable) { totals.blocked++; continue; }
   // Schema oracle: an authoring numeric limit cannot be a word.
   const invalid = await request('reject nonnumeric minimum', 'POST', root + '/data-points', {
     masOpeStepId: numeric[0].stepId, referenceCode: 'BAD' + suffix,

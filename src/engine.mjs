@@ -49,6 +49,80 @@ export function identifier(data, names) {
   }
   return undefined;
 }
+
+function payloadObjects(data) {
+  return [data, data?.data, data?.result, data?.item, data?.value];
+}
+
+/** Creating an operation inserts step 1. Posting that number again is a 409. */
+export function seededStepFromOperation(data) {
+  for (const obj of payloadObjects(data)) {
+    if (!obj || typeof obj !== 'object' || !Array.isArray(obj.steps)) continue;
+    const step = obj.steps.find((row) => row && Number(row.stepNo) === 1 && typeof row.masOpeStepId === 'string')
+      ?? obj.steps.find((row) => row && typeof row.masOpeStepId === 'string');
+    if (step) return { masOpeStepId: step.masOpeStepId, stepNo: Number(step.stepNo) };
+  }
+  return undefined;
+}
+
+export function stepsAfterSeededOperation(operation, plannedCount) {
+  const seeded = seededStepFromOperation(operation);
+  if (!seeded || !Number.isInteger(plannedCount) || plannedCount < 1) {
+    return { seeded: seeded ?? null, name: null, creates: [] };
+  }
+  const creates = [];
+  for (let offset = 1; offset < plannedCount; offset++) {
+    creates.push({
+      stepNo: seeded.stepNo + offset,
+      stepTitle: 'Inspect and record ' + (offset + 1),
+      toolsFirst: false,
+    });
+  }
+  return {
+    seeded,
+    name: { stepTitle: 'Inspect and record 1', toolsFirst: false },
+    creates,
+  };
+}
+
+export function classifyAuthoringConflict(status, error) {
+  if (status !== 409 || typeof error !== 'string') return null;
+  const step = /^Step number (\d+) is already used in this operation$/.exec(error);
+  if (step) return { kind: 'step-number', stepNo: Number(step[1]) };
+  const operation = /^Operation number (.+) already exists on this master item$/.exec(error);
+  if (operation) return { kind: 'operation-number', operationNo: operation[1] };
+  return { kind: 'other', error };
+}
+
+export function releaseSignoffGap(error) {
+  if (typeof error !== 'string') return null;
+  const match = /^Every step must have at least one sign-off before release \(operation (.+) step (\d+)\)\.$/.exec(error);
+  return match ? { operationNo: match[1], stepNo: Number(match[2]) } : null;
+}
+
+export function pickReleasableSignoffRequirement(payload) {
+  const rows = Array.isArray(payload?.requirements)
+    ? payload.requirements
+    : Array.isArray(payload?.data?.requirements)
+      ? payload.data.requirements
+      : [];
+  const active = rows.filter((row) =>
+    row
+    && typeof row.signOffRequirementId === 'string'
+    && row.isActive !== false
+    && !row.requiresSignOffRequirementId);
+  const stepScoped = active.filter((row) => row.scope == null || row.scope === 'step');
+  const pool = stepScoped.length > 0 ? stepScoped : active;
+  return pool.find((row) => row.level == null || Number(row.level) === 1) ?? pool[0] ?? null;
+}
+
+export function signoffForRelease(masOpeStepId, requirement) {
+  return {
+    masOpeStepId,
+    signOffRequirementId: requirement.signOffRequirementId,
+    level: 1,
+  };
+}
 export function reportWriter(dir, seed) {
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, 'events.jsonl');

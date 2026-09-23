@@ -1,0 +1,23 @@
+---
+description: Lecture seule hors de FlashWorkChaos ; toute écriture reste dans ce dépôt
+alwaysApply: true
+---
+
+# Frontière de dépôt
+
+Ce workspace est `c:\development\FlashWorkChaos`. Les modifications se font ici seulement.
+
+- Lire et chercher dans les autres dépôts est permis, y compris `c:\development\FlashWorkBE`, `FlashWorkFE`, `FlashWork-parallel*` et une recherche depuis `c:\development`.
+- Ne pas y créer, modifier, supprimer, formater ni déplacer de fichier.
+- Ne pas y lancer git (commit, checkout, reset, push) ni une commande qui change le disque, la base ou un processus.
+- Si la correction exige d'écrire ailleurs, s'arrêter et le dire. Appliquer le changement dans FlashWorkChaos, ou expliquer ce qui bloquerait dans l'autre dépôt sans l'éditer.
+
+```text
+# Autorisé
+Read c:\development\FlashWorkBE\src\services\master-item.service.ts
+rg pattern c:\development\FlashWorkBE
+
+# Interdit
+Éditer un fichier sous c:\development\FlashWorkBE
+git -C c:\development\FlashWorkBE commit
+```
