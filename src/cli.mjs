@@ -1,39 +1,87 @@
-import { Api, plan, integer, rng, identifier, reportWriter, stepsAfterSeededOperation, pickReleasableSignoffRequirement, signoffForRelease } from './engine.mjs';
+import {
+  Api, identifier, reportWriter, stepsAfterSeededOperation, instructionBlocksBody,
+  catalogGaps, workOrderGaps, levelCounts,
+} from './engine.mjs';
+import {
+  bindPlan, compileScenarios, coherenceViolations, coverageViolations, dataPointRequest,
+  diffScenario, resolveSignoffRequirement, summarizeObserved, summarizeScenario,
+} from './scenario.mjs';
+import { dataCapturePlan } from './capture-plan.mjs';
+import { runDataCapture } from './capture-run.mjs';
+import { partsCapturePlan, summarizePartsPlan } from './parts-plan.mjs';
+import { runPartsCapture } from './parts-run.mjs';
+import { summarizeToolsPlan, toolsCapturePlan } from './tools-plan.mjs';
+import { runToolsCapture } from './tools-run.mjs';
+import { redactSecrets } from './signatures-redact.mjs';
+import { summarizeSignaturesPlan, signaturesCapturePlan } from './signatures-plan.mjs';
+import { runSignaturesCapture } from './signatures-run.mjs';
+import { lifecyclePlan, summarizeLifecyclePlan } from './lifecycle-plan.mjs';
+import { runLifecycle } from './lifecycle-run.mjs';
 import path from 'node:path';
 
 const arg = (name, fallback) => {
-  const found = process.argv.find(x => x.startsWith('--' + name + '='));
+  const found = process.argv.find((item) => item.startsWith('--' + name + '='));
   return found ? found.slice(name.length + 3) : fallback;
 };
 const seed = Number(arg('seed', '847291'));
 const count = Number(arg('po', '20'));
-if (!Number.isSafeInteger(seed) || !Number.isInteger(count) || count < 1 || count > 5000)
+if (!Number.isSafeInteger(seed) || !Number.isInteger(count) || count < 1 || count > 5000) {
   throw new Error('Use --seed=integer and --po=1..5000');
-const scenarios = plan(seed, count);
-const totals = { masterItems: 0, operations: 0, steps: 0, numericData: 0,
-  textData: 0, productionOrders: 0, workOrders: 0, negativeChecks: 0, findings: 0, blocked: 0 };
+}
+const compiled = compileScenarios(seed, count);
+const planViolations = compiled.scenarios.flatMap((scenario) => [
+  ...coherenceViolations(scenario),
+  ...coverageViolations(scenario),
+]);
 if (process.argv.includes('--dry-run')) {
-  console.log(JSON.stringify({ seed, count, planned: {
-    operations: scenarios.reduce((n, s) => n + s.operations, 0),
-    minimumSteps: scenarios.reduce((n, s) => n + s.operations, 0),
-    minimumData: scenarios.reduce((n, s) => n + s.operations, 0),
-    units: scenarios.reduce((n, s) => n + s.units, 0),
-    invalidNumeric: scenarios.reduce((n, s) => n + s.invalidNumeric, 0),
-  } }, null, 2));
-  process.exit(0);
+  const capturePlan = dataCapturePlan(compiled.scenarios[0]);
+  const partsPlan = summarizePartsPlan(partsCapturePlan(seed));
+  const toolsPlan = summarizeToolsPlan(toolsCapturePlan(seed));
+  const signaturesPlan = summarizeSignaturesPlan(signaturesCapturePlan(seed));
+  console.log(JSON.stringify({
+    seed,
+    count,
+    planHash: compiled.planHash,
+    capturePlanHash: capturePlan.capturePlanHash,
+    partsPlanHash: partsPlan.partsPlanHash,
+    partsActions: partsPlan.actionCount,
+    partsModes: partsPlan.byTraceabilityMode,
+    toolsPlanHash: toolsPlan.toolsPlanHash,
+    toolsActions: toolsPlan.actionCount,
+    toolsPolicies: toolsPlan.byCapturePolicy,
+    signaturesPlanHash: signaturesPlan.signaturesPlanHash,
+    signaturesActions: signaturesPlan.actionCount,
+    signaturesByAction: signaturesPlan.byAction,
+    lifecyclePlanHash: summarizeLifecyclePlan(lifecyclePlan(seed)).lifecyclePlanHash,
+    lifecycleActions: summarizeLifecyclePlan(lifecyclePlan(seed)).actionCount,
+    captureBlocked: capturePlan.blockedTypes,
+    violations: planViolations,
+    scenarios: compiled.scenarios.map(summarizeScenario),
+  }, null, 2));
+  process.exit(planViolations.length === 0 ? 0 : 1);
+}
+if (planViolations.length > 0) {
+  throw new Error('Seeded plan violates manufacturing rules: ' + planViolations.map((item) => item.reason).join('; '));
 }
 const base = process.env.FLASHWORK_BASE_URL;
 const client = process.env.FLASHWORK_CLIENT_ID;
 const user = process.env.FLASHWORK_USER_ID;
 if (!base || !client || !user) throw new Error('Set FLASHWORK_BASE_URL, FLASHWORK_CLIENT_ID and FLASHWORK_USER_ID for a local test tenant');
 const host = new URL(base);
-if (!['localhost', '127.0.0.1', '::1'].includes(host.hostname) && process.env.FLASHWORK_ALLOW_REMOTE !== 'yes')
+if (!['localhost', '127.0.0.1', '::1'].includes(host.hostname) && process.env.FLASHWORK_ALLOW_REMOTE !== 'yes') {
   throw new Error('Remote target requires FLASHWORK_ALLOW_REMOTE=yes');
+}
 const api = new Api(base, client, user);
 const runId = arg('run-id', String(seed) + '-' + Date.now().toString(36));
 if (!/^[a-zA-Z0-9-]{1,40}$/.test(runId)) throw new Error('Invalid run-id');
+const prefix = arg('prefix', 'CH');
+if (!/^[A-Z]{2,5}$/.test(prefix)) throw new Error('prefix must be 2–5 uppercase letters');
+const bound = bindPlan(compiled, { prefix, runId });
 const output = reportWriter(path.resolve('runs', runId), seed);
-const random = rng(seed ^ 0x9e3779b9);
+const totals = {
+  masterItems: 0, operations: 0, steps: 0, numericData: 0, textData: 0,
+  productionOrders: 0, workOrders: 0, negativeChecks: 0, findings: 0, blocked: 0,
+};
 let action = 0;
 async function request(label, method, route, body, expectation = 'success') {
   const seq = ++action;
@@ -62,97 +110,197 @@ function requiredId(result, keys, label) {
   }
   return id;
 }
-const prefix = arg('prefix', 'CH');
-if (!/^[A-Z]{2,5}$/.test(prefix)) throw new Error('prefix must be 2–5 uppercase letters');
+
+const quotaGaps = [];
+let captureReport = null;
+const differences = [];
+const masterReads = [];
+const workOrderReads = [];
+const observed = [];
+const catalogRecords = { parts: [], tools: [] };
+const partIds = new Map();
+const toolIds = new Map();
+const category = await request('create part category', 'POST', '/part-categories', {
+  categoryName: bound.catalog.categoryName,
+  description: 'Chaos catalog ' + runId,
+});
+const partCategorieId = category.ok ? identifier(category.data, ['partCategorieId']) : undefined;
+if (!partCategorieId) {
+  totals.blocked++;
+  quotaGaps.push({ level: 'catalog', reason: 'part category was not created', ids: { categoryName: bound.catalog.categoryName } });
+}
+for (const partSpec of bound.catalog.parts) {
+  const record = { partNumber: partSpec.partNumber, traceabilityMode: partSpec.traceabilityMode, partId: null, confirmed: false };
+  catalogRecords.parts.push(record);
+  if (!partCategorieId) continue;
+  const created = await request('create part', 'POST', '/parts', {
+    partNumber: partSpec.partNumber, description: partSpec.description,
+    partCategorieId, traceabilityMode: partSpec.traceabilityMode, status: 'Active',
+  });
+  record.partId = created.ok ? identifier(created.data, ['partId']) : null;
+  if (!record.partId) { totals.blocked++; continue; }
+  partIds.set(partSpec.partNumber, record.partId);
+  const read = await request('read part', 'GET', '/parts/' + record.partId);
+  record.confirmed = read.ok && read.data?.traceabilityMode === partSpec.traceabilityMode && read.data?.partId === record.partId;
+  if (!record.confirmed) totals.blocked++;
+}
+for (const toolSpec of bound.catalog.tools) {
+  const record = {
+    toolNumber: toolSpec.toolNumber, capturePolicy: toolSpec.capturePolicy,
+    toolId: null, toolInstanceId: null, confirmed: false,
+  };
+  catalogRecords.tools.push(record);
+  const body = {
+    toolNumber: toolSpec.toolNumber, name: toolSpec.name, description: toolSpec.description,
+    defaultCapturePolicy: toolSpec.capturePolicy, calibrationBasis: toolSpec.calibrationBasis,
+  };
+  if (toolSpec.defaultCalibrationIntervalDays) body.defaultCalibrationIntervalDays = toolSpec.defaultCalibrationIntervalDays;
+  if (toolSpec.defaultCalibrationIntervalUses) body.defaultCalibrationIntervalUses = toolSpec.defaultCalibrationIntervalUses;
+  const created = await request('create tool', 'POST', '/tools', body);
+  record.toolId = created.ok ? identifier(created.data, ['toolId']) : null;
+  if (!record.toolId) { totals.blocked++; continue; }
+  toolIds.set(toolSpec.toolNumber, record.toolId);
+  const read = await request('read tool', 'GET', '/tools/' + record.toolId);
+  record.confirmed = read.ok && read.data?.defaultCapturePolicy === toolSpec.capturePolicy && read.data?.toolId === record.toolId;
+  if (!record.confirmed) totals.blocked++;
+  const instanceBody = {
+    toolId: record.toolId, assetTag: toolSpec.assetTag, serialNo: toolSpec.serialNo, status: 'active',
+  };
+  if (toolSpec.lastCalibratedAt) instanceBody.lastCalibratedAt = toolSpec.lastCalibratedAt;
+  const instance = await request('create tool instance', 'POST', '/tool-instances', instanceBody);
+  record.toolInstanceId = instance.ok ? identifier(instance.data, ['toolInstanceId']) : null;
+  if (!record.toolInstanceId) { totals.blocked++; continue; }
+  const listed = await request('read tool instances', 'GET', '/tool-instances?toolId=' + encodeURIComponent(record.toolId));
+  const rows = listed.ok && Array.isArray(listed.data?.toolInstances) ? listed.data.toolInstances : [];
+  if (!rows.some((row) => row.toolInstanceId === record.toolInstanceId)) {
+    totals.blocked++;
+    record.toolInstanceId = null;
+  }
+}
+quotaGaps.push(...catalogGaps(catalogRecords));
 const catalogue = await request('list sign-off requirements', 'GET', '/sign-off-requirements?activeOnly=true');
-const signoffRequirement = catalogue.ok ? pickReleasableSignoffRequirement(catalogue.data) : null;
-if (!signoffRequirement) {
+const signoffIds = {};
+for (const role of ['operator', 'inspector']) {
+  const resolved = catalogue.ok ? resolveSignoffRequirement(catalogue.data, { role, level: 1 }) : { requirement: null, matched: false, role };
+  if (!resolved.requirement) continue;
+  signoffIds[role] = resolved.requirement.signOffRequirementId;
+  if (!resolved.matched) {
+    differences.push({
+      severity: 'info',
+      reason: 'catalogue has no ' + role + ' sign-off; used the first releasable requirement',
+      ids: { role, signOffRequirementId: signoffIds[role] },
+    });
+  }
+}
+if (!signoffIds.operator && !signoffIds.inspector) {
   totals.blocked++;
   output.write({ seq: ++action, label: 'BLOCKED sign-off requirement', response: catalogue.data });
 }
-for (const scenario of scenarios) {
-  const suffix = String(scenario.index).padStart(4, '0');
-  const mi = 'MI-' + prefix + runId.replaceAll('-', '').slice(0, 12).toUpperCase() + suffix;
-  const po = 'PO' + prefix + runId.replaceAll('-', '').slice(0, 12).toUpperCase() + suffix;
-  const root = '/master-items/' + encodeURIComponent(mi);
+const effectivityDate = new Date().toISOString().slice(0, 10);
+
+for (const scenario of bound.scenarios) {
+  const root = '/master-items/' + encodeURIComponent(scenario.masterItemNo);
   const made = await request('create master', 'POST', '/master-items', {
-    masterItemNo: mi, masterType: 'Prod', description: 'Chaos ' + runId + ' ' + suffix,
+    masterItemNo: scenario.masterItemNo, masterType: 'Prod', description: scenario.description,
     seedInitialStructure: false,
   });
   if (!made.ok) { totals.blocked++; continue; }
   totals.masterItems++;
   const numeric = [];
-  let dpSeq = 0;
-  let localOps = 0;
-  let publishable = Boolean(signoffRequirement);
-  async function addDataPoints(stepId, slots) {
-    for (let d = 0; d < (slots ?? 0); d++) {
-      const type = (dpSeq++ % 3 === 0) ? 'text' : 'number';
-      const body = { masOpeStepId: stepId, referenceCode: 'D' + String(dpSeq).padStart(4, '0'),
-        label: type === 'number' ? 'Measured dimension ' + dpSeq : 'Inspection note ' + dpSeq,
-        dataType: type, isMandatory: false };
-      if (type === 'number') Object.assign(body, { minValue: 0, maxValue: 100, nominalValue: 50, unit: 'mm' });
-      const point = await request('add data point', 'POST', root + '/data-points', body);
-      if (point.ok) {
-        totals[type === 'number' ? 'numericData' : 'textData']++;
-        if (type === 'number') numeric.push({ stepId, dataId: identifier(point.data, ['masStepDataId', 'id']) });
-      } else totals.blocked++;
+  let publishable = Boolean(signoffIds.operator || signoffIds.inspector);
+  async function authorStep(stepId, step) {
+    for (const part of step.parts) {
+      const partId = partIds.get(part.partNumber);
+      if (!partId) { totals.blocked++; publishable = false; continue; }
+      const attached = await request('add step part', 'POST', root + '/parts', {
+        masOpeStepId: stepId, partId, quantityRequired: part.quantity,
+      });
+      if (!attached.ok) { totals.blocked++; publishable = false; }
     }
+    for (const tool of step.tools) {
+      const toolId = toolIds.get(tool.toolNumber);
+      if (!toolId) { totals.blocked++; publishable = false; continue; }
+      const attached = await request('add step tool', 'POST', root + '/tools', {
+        masOpeStepId: stepId, toolId, capturePolicy: tool.capturePolicy, useQty: 1,
+        specText: 'Utiliser ' + tool.name + ' et confirmer son identité.',
+      });
+      if (!attached.ok) { totals.blocked++; publishable = false; }
+    }
+    for (const point of step.dataPoints) {
+      const body = dataPointRequest(stepId, point);
+      const created = await request('add data point', 'POST', root + '/data-points', body);
+      if (!created.ok) { totals.blocked++; publishable = false; continue; }
+      if (body.dataType === 'number' || body.dataType === 'measurement') {
+        totals.numericData++;
+        numeric.push({ stepId, referenceCode: point.referenceCode });
+      } else if (body.dataType === 'text') totals.textData++;
+    }
+    const blocks = await request('write instruction', 'PUT', '/mas-ope-step/' + stepId + '/blocks', instructionBlocksBody(step.instruction));
+    if (!blocks.ok) { totals.blocked++; publishable = false; }
+    const signOffRequirementId = signoffIds[step.signoff.role] ?? signoffIds.operator ?? signoffIds.inspector;
+    if (!signOffRequirementId) { publishable = false; return; }
+    const sign = await request('add sign-off', 'POST', root + '/signoffs', {
+      masOpeStepId: stepId, signOffRequirementId, level: 1,
+    });
+    if (!sign.ok) { totals.blocked++; publishable = false; }
   }
-  for (let o = 0; o < scenario.operations; o++) {
+  for (const operation of scenario.operations) {
     const op = await request('add operation', 'POST', root + '/operations', {
-      operationNo: String((o + 1) * 10), operationTitle: 'Assembly operation ' + (o + 1),
-      mustCompleteBeforeLater: o % 3 !== 0,
+      operationNo: operation.operationNo,
+      operationTitle: operation.title,
+      operationDescription: operation.description,
+      mustCompleteBeforeLater: operation.mustCompleteBeforeLater,
     });
     if (!op.ok) { totals.blocked++; publishable = false; continue; }
     const opId = requiredId(op, ['masOpeId', 'id'], 'operation id');
     if (!opId) { publishable = false; continue; }
     totals.operations++;
-    localOps++;
-    // The create response already contains step 1. Reuse it; further steps start at 2.
-    const authored = stepsAfterSeededOperation(op.data, scenario.stepsPerOperation[o]);
+    const authored = stepsAfterSeededOperation(op.data, operation.steps);
     if (!authored.seeded) { totals.blocked++; publishable = false; continue; }
     const named = await request('name seeded step', 'PATCH', root + '/steps/' + authored.seeded.masOpeStepId, authored.name);
     if (!named.ok) { totals.blocked++; publishable = false; }
     totals.steps++;
-    const stepIds = [authored.seeded.masOpeStepId];
-    await addDataPoints(authored.seeded.masOpeStepId, scenario.dataPerStep[o * 3]);
-    for (let s = 0; s < authored.creates.length; s++) {
-      const spec = authored.creates[s];
+    await authorStep(authored.seeded.masOpeStepId, operation.steps[0]);
+    for (let index = 0; index < authored.creates.length; index++) {
+      const stepSpec = authored.creates[index];
       const step = await request('add step', 'POST', root + '/steps', {
-        masOpeId: opId, stepNo: spec.stepNo, stepTitle: spec.stepTitle, toolsFirst: spec.toolsFirst,
+        masOpeId: opId, stepNo: stepSpec.stepNo, stepTitle: stepSpec.stepTitle,
+        stepDescription: stepSpec.stepDescription, toolsFirst: false,
       });
       if (!step.ok) { totals.blocked++; publishable = false; continue; }
       const stepId = requiredId(step, ['masOpeStepId', 'id'], 'step id');
       if (!stepId) { publishable = false; continue; }
       totals.steps++;
-      stepIds.push(stepId);
-      await addDataPoints(stepId, scenario.dataPerStep[o * 3 + s + 1]);
-    }
-    if (!signoffRequirement) continue;
-    for (const stepId of stepIds) {
-      const sign = await request('add sign-off', 'POST', root + '/signoffs', signoffForRelease(stepId, signoffRequirement));
-      if (!sign.ok) { totals.blocked++; publishable = false; }
+      await authorStep(stepId, operation.steps[index + 1]);
     }
   }
-  if (localOps < 3 || numeric.length === 0 || !publishable) { totals.blocked++; continue; }
-  // Schema oracle: an authoring numeric limit cannot be a word.
+  const masterRead = await request('read master', 'GET', root);
+  const scenarioDiffs = diffScenario(scenario, masterRead.ok ? masterRead.data : null, { signoffIds, surface: 'master' });
+  differences.push(...scenarioDiffs);
+  if (masterRead.ok) {
+    masterReads.push(masterRead.data);
+    observed.push(summarizeObserved(masterRead.data));
+  }
+  const material = scenarioDiffs.filter((item) => item.severity === 'material');
+  if (!publishable || !masterRead.ok || material.length > 0 || numeric.length === 0) {
+    totals.blocked++;
+    continue;
+  }
+  const suffix = String(scenario.index).padStart(4, '0');
   const invalid = await request('reject nonnumeric minimum', 'POST', root + '/data-points', {
     masOpeStepId: numeric[0].stepId, referenceCode: 'BAD' + suffix,
     label: 'Bad numeric boundary', dataType: 'number', minValue: 'potato',
   }, 'reject');
   if (invalid.ok) totals.negativeChecks++;
-  // Release is an explicit contract gate. A rejected release blocks this PO; it is not silently counted as coverage.
   const released = await request('release master', 'PATCH', root, { status: 'Released' });
   if (!released.ok) { totals.blocked++; continue; }
   const order = await request('create PO', 'POST', '/production-orders', {
-    source: 'master_item', orderNo: po, orderType: 'Prod', masterItemNo: mi,
-    effectivityDate: new Date().toISOString().slice(0, 10), quantityPlanned: scenario.units,
-    executionMode: 'sequential',
+    source: 'master_item', orderNo: scenario.orderNo, orderType: 'Prod', masterItemNo: scenario.masterItemNo,
+    effectivityDate, quantityPlanned: scenario.units, executionMode: 'sequential',
   });
   if (!order.ok) { totals.blocked++; continue; }
   totals.productionOrders++;
-  const orderRoot = '/production-orders/' + encodeURIComponent(po);
+  const orderRoot = '/production-orders/' + encodeURIComponent(scenario.orderNo);
   const rel = await request('release PO', 'POST', orderRoot + '/release', {});
   if (!rel.ok) { totals.blocked++; continue; }
   for (let unit = 1; unit <= scenario.units; unit++) {
@@ -160,18 +308,257 @@ for (const scenario of scenarios) {
     if (wo.ok) totals.workOrders++; else totals.blocked++;
     const woId = identifier(wo.data, ['workOrderId', 'id']);
     if (!wo.ok || !woId) continue;
-    const entry = numeric[integer(random, 0, numeric.length - 1)];
-    if (!entry.dataId) { totals.blocked++; continue; }
     const detail = await request('read WO detail', 'GET', orderRoot + '/work-orders/' + woId);
-    if (!detail.ok) continue;
-    // Production IDs differ from the draft IDs; never claim capture coverage from a draft identifier.
-    output.write({ seq: ++action, label: 'snapshot read', woId, draftDataId: entry.dataId });
+    if (!detail.ok) { totals.blocked++; continue; }
+    workOrderReads.push(detail.data);
+    const snapshotGaps = workOrderGaps(masterRead.data, detail.data);
+    quotaGaps.push(...snapshotGaps);
+    const woDiffs = diffScenario(scenario, detail.data, { signoffIds, surface: 'workOrder' })
+      .map((item) => ({ ...item, ids: { ...item.ids, workOrderId: woId } }));
+    differences.push(...woDiffs);
+    if (snapshotGaps.length > 0 || woDiffs.some((item) => item.severity === 'material')) totals.blocked++;
+    output.write({ seq: ++action, label: 'snapshot read', woId, referenceCode: numeric[0].referenceCode });
+    if (scenario.index === 1 && unit === 1) {
+      captureReport = await runDataCapture({
+        call: async (label, method, route, body) => {
+          const seq = ++action;
+          try {
+            const result = await api.call(method, route, body);
+            output.write({ seq, label, method, route, body, status: result.status, response: result.data, phase: 'capture' });
+            return { seq, status: result.status, data: result.data };
+          } catch (error) {
+            output.write({ seq, label, method, route, body, error: String(error), phase: 'capture' });
+            return { seq, status: 0, data: { error: String(error) } };
+          }
+        },
+        readDetail: async () => {
+          const detail = await api.call('GET', orderRoot + '/work-orders/' + woId);
+          output.write({ seq: ++action, label: 'reread WO', method: 'GET', route: orderRoot + '/work-orders/' + woId, status: detail.status, response: detail.data, phase: 'capture' });
+          return detail.status >= 200 && detail.status < 300 ? detail.data : null;
+        },
+        scenario,
+        catalog: bound.catalog,
+        orderNo: scenario.orderNo,
+        workOrderId: woId,
+        seed,
+        runId,
+      });
+    }
   }
 }
-const minimum = { operations: 3 * count, numericData: count, negativeChecks: count,
-  productionOrders: count, workOrders: count };
+const expectedWorkOrders = bound.scenarios.reduce((sum, scenario) => sum + scenario.units, 0);
+if (masterReads.length < count) {
+  quotaGaps.push({ level: 'masterItem', reason: 'fewer master item read-backs than scenarios', ids: { expected: count, observed: masterReads.length } });
+}
+if (workOrderReads.length < expectedWorkOrders) {
+  quotaGaps.push({ level: 'workOrder', reason: 'fewer verified work order snapshots than planned units', ids: { expected: expectedWorkOrders, observed: workOrderReads.length } });
+}
+for (const difference of differences) {
+  if (difference.severity !== 'material') continue;
+  quotaGaps.push({
+    level: difference.ids?.workOrderId ? 'workOrder' : 'masterItem',
+    reason: difference.reason,
+    ids: difference.ids,
+  });
+}
+const counts = levelCounts(catalogRecords, masterReads, workOrderReads);
+const gapsFor = (level) => quotaGaps.filter((gap) => gap.level === level);
+const levels = {
+  catalog: { pass: gapsFor('catalog').length === 0, counts: counts.catalog, gaps: gapsFor('catalog') },
+  masterItems: { pass: gapsFor('masterItem').length === 0, counts: counts.masterItems, gaps: gapsFor('masterItem') },
+  workOrders: { pass: gapsFor('workOrder').length === 0, counts: counts.workOrders, gaps: gapsFor('workOrder') },
+};
+let partsReport = null;
+if (partCategorieId && (signoffIds.operator || signoffIds.inspector)) {
+  partsReport = await runPartsCapture({
+    setup: async (label, method, route, body) => {
+      const seq = ++action;
+      try {
+        const result = await api.call(method, route, body);
+        const ok = result.status >= 200 && result.status < 300;
+        output.write({ seq, label, method, route, body, status: result.status, response: result.data, ok, phase: 'parts-setup' });
+        return { ...result, ok };
+      } catch (error) {
+        output.write({ seq, label, method, route, body, error: String(error), ok: false, phase: 'parts-setup' });
+        return { ok: false, status: 0, data: { error: String(error) } };
+      }
+    },
+    call: async (label, method, route, body) => {
+      const seq = ++action;
+      try {
+        const result = await api.call(method, route, body);
+        output.write({ seq, label, method, route, body, status: result.status, response: result.data, phase: 'parts' });
+        return { seq, status: result.status, data: result.data };
+      } catch (error) {
+        output.write({ seq, label, method, route, body, error: String(error), phase: 'parts' });
+        return { seq, status: 0, data: { error: String(error) } };
+      }
+    },
+    seed,
+    runId,
+    prefix,
+    partCategorieId,
+    signOffRequirementId: signoffIds.operator ?? signoffIds.inspector,
+    effectivityDate,
+  });
+}
+let toolsReport = null;
+if (signoffIds.operator || signoffIds.inspector) {
+  toolsReport = await runToolsCapture({
+    setup: async (label, method, route, body) => {
+      const seq = ++action;
+      try {
+        const result = await api.call(method, route, body);
+        const ok = result.status >= 200 && result.status < 300;
+        output.write({ seq, label, method, route, body, status: result.status, response: result.data, ok, phase: 'tools-setup' });
+        return { ...result, ok };
+      } catch (error) {
+        output.write({ seq, label, method, route, body, error: String(error), ok: false, phase: 'tools-setup' });
+        return { ok: false, status: 0, data: { error: String(error) } };
+      }
+    },
+    call: async (label, method, route, body) => {
+      const seq = ++action;
+      try {
+        const result = await api.call(method, route, body);
+        output.write({ seq, label, method, route, body, status: result.status, response: result.data, phase: 'tools' });
+        return { seq, status: result.status, data: result.data };
+      } catch (error) {
+        output.write({ seq, label, method, route, body, error: String(error), phase: 'tools' });
+        return { seq, status: 0, data: { error: String(error) } };
+      }
+    },
+    seed,
+    runId,
+    prefix,
+    signOffRequirementId: signoffIds.operator ?? signoffIds.inspector,
+    effectivityDate,
+  });
+}
+let signaturesReport = null;
+if (signoffIds.operator || signoffIds.inspector) {
+  signaturesReport = await runSignaturesCapture({
+    setup: async (label, method, route, body) => {
+      const seq = ++action;
+      try {
+        const result = await api.call(method, route, body);
+        const safeBody = redactSecrets(body);
+        const safeResponse = redactSecrets(result.data);
+        output.write({ seq, label, method, route, body: safeBody, status: result.status, response: safeResponse, ok: result.status >= 200 && result.status < 300, phase: 'signatures-setup' });
+        return { ...result, ok: result.status >= 200 && result.status < 300 };
+      } catch (error) {
+        output.write({ seq, label, method, route, body: redactSecrets(body), error: String(error), ok: false, phase: 'signatures-setup' });
+        return { ok: false, status: 0, data: { error: String(error) } };
+      }
+    },
+    call: async (label, method, route, body, options) => {
+      const seq = ++action;
+      try {
+        const result = await api.call(method, route, body, options);
+        output.write({ seq, label, method, route, body: redactSecrets(body), status: result.status, response: redactSecrets(result.data), phase: 'signatures', actor: options?.userId ?? user });
+        return { seq, status: result.status, data: result.data };
+      } catch (error) {
+        output.write({ seq, label, method, route, body: redactSecrets(body), error: String(error), phase: 'signatures' });
+        return { seq, status: 0, data: { error: String(error) } };
+      }
+    },
+    seed, runId, prefix, effectivityDate, envUserId: user,
+  });
+}
+let lifecycleReport = null;
+lifecycleReport = await runLifecycle({
+  setup: async (label, method, route, body) => {
+    const seq = ++action;
+    try {
+      const result = await api.call(method, route, body);
+      output.write({ seq, label, method, route, body: redactSecrets(body), status: result.status, response: redactSecrets(result.data), ok: result.status >= 200 && result.status < 300, phase: 'lifecycle-setup' });
+      return { ...result, ok: result.status >= 200 && result.status < 300 };
+    } catch (error) {
+      output.write({ seq, label, method, route, body: redactSecrets(body), error: String(error), ok: false, phase: 'lifecycle-setup' });
+      return { ok: false, status: 0, data: { error: String(error) } };
+    }
+  },
+  call: async (label, method, route, body, options) => {
+    const seq = ++action;
+    try {
+      const result = await api.call(method, route, body, options);
+      output.write({ seq, label, method, route, body: redactSecrets(body), status: result.status, response: redactSecrets(result.data), phase: 'lifecycle', actor: options?.userId ?? user });
+      return { seq, status: result.status, data: result.data };
+    } catch (error) {
+      output.write({ seq, label, method, route, body: redactSecrets(body), error: String(error), phase: 'lifecycle' });
+      return { seq, status: 0, data: { error: String(error) } };
+    }
+  },
+  seed, runId, prefix, effectivityDate, envUserId: user,
+  foreignOrderNo: bound.scenarios[0]?.orderNo ?? null,
+});
+const notCovered = [
+  ...(partsReport?.pass === true ? [] : ['partCapture']),
+  ...(toolsReport?.pass === true ? [] : ['toolCapture']),
+  ...(signaturesReport?.pass === true ? [] : ['signoffChaos']),
+  ...(lifecycleReport?.executionPass === true ? [] : ['toolExecution']),
+  'run2Plus', 'sv2Plus', 'andon', 'ncr', 'variance',
+];
+const minimum = {
+  operations: 3 * count, numericData: count, negativeChecks: count,
+  productionOrders: count, workOrders: count,
+};
 const missing = Object.fromEntries(Object.entries(minimum).filter(([key, goal]) => totals[key] < goal));
-const summary = { seed, runId, count, actions: action, totals, minimum, missing, pass: totals.findings === 0 && totals.blocked === 0 && Object.keys(missing).length === 0 };
+const setupPass = totals.findings === 0 && totals.blocked === 0 && Object.keys(missing).length === 0
+  && levels.catalog.pass && levels.masterItems.pass && levels.workOrders.pass
+  && differences.every((item) => item.severity !== 'material');
+const capturePass = captureReport?.capturePass === true;
+const chaosPass = captureReport?.chaosPass === true;
+const dataPass = capturePass && chaosPass;
+const partsCapturePass = partsReport?.capturePass === true;
+const partsChaosPass = partsReport?.chaosPass === true;
+const summary = {
+  seed,
+  runId,
+  count,
+  planHash: compiled.planHash,
+  capturePlanHash: captureReport?.capturePlanHash ?? null,
+  planned: bound.scenarios.map(summarizeScenario),
+  observed,
+  differences,
+  execution: { effectivityDate },
+  capture: captureReport ? {
+    locator: captureReport.locator ?? null,
+    dataTypes: captureReport.dataTypes ?? null,
+    concurrency: captureReport.concurrency ?? [],
+    counters: captureReport.counters,
+    findings: captureReport.findings,
+  } : null,
+  actions: action,
+  totals,
+  levels,
+  notCovered,
+  minimum,
+  missing,
+  parts: partsReport,
+  tools: toolsReport,
+  signatures: signaturesReport,
+  cancellationRaces: signaturesReport?.cancellationRaces ?? null,
+  workOrderLifecycle: lifecycleReport,
+  setupPass,
+  capturePass,
+  chaosPass,
+  dataPass,
+  partsCapturePass,
+  partsChaosPass,
+  partsPass: partsCapturePass && partsChaosPass,
+  toolsCapturePass: toolsReport?.capturePass === true,
+  toolsChaosPass: toolsReport?.chaosPass === true,
+  toolsPass: toolsReport?.capturePass === true && toolsReport?.chaosPass === true,
+  signaturesCapturePass: signaturesReport?.capturePass === true,
+  signaturesChaosPass: signaturesReport?.chaosPass === true,
+  signaturesPass: signaturesReport?.capturePass === true && signaturesReport?.chaosPass === true,
+  workOrderExecutionPass: lifecycleReport?.executionPass === true,
+  workOrderCompletionPass: lifecycleReport?.completionPass === true,
+  asBuiltPass: lifecycleReport?.asBuiltPass === true,
+  lifecycleChaosPass: lifecycleReport?.chaosPass === true,
+  pass: setupPass && dataPass && partsCapturePass && partsChaosPass && toolsReport?.capturePass === true && toolsReport?.chaosPass === true && signaturesReport?.capturePass === true && signaturesReport?.chaosPass === true && lifecycleReport?.pass === true,
+};
 output.finish(summary);
 console.log(JSON.stringify(summary, null, 2));
 process.exitCode = summary.pass ? 0 : 1;
