@@ -276,6 +276,61 @@ function sameCapture(before, after) {
   return JSON.stringify(before ?? null) === JSON.stringify(after ?? null);
 }
 
+/** A null write on empty DATA is a first capture. A null write on stored text is a clear. */
+export function classifyNullDataWrite(before) {
+  const text = before?.text ?? before?.capturedValueText ?? null;
+  if (text == null || String(text).trim() === '') return 'first-capture';
+  return 'comment-attack';
+}
+
+function toolFieldDrift(before, after) {
+  const left = before ?? {};
+  const right = after ?? {};
+  const keys = [...new Set([...Object.keys(left), ...Object.keys(right)])].sort();
+  const reasons = [];
+  for (const key of keys) {
+    if (JSON.stringify(left[key] ?? null) !== JSON.stringify(right[key] ?? null)) reasons.push(key + ' changed');
+  }
+  return reasons;
+}
+
+function preparedToolRemoved(before, after) {
+  return ['toolInstanceId', 'toolSerialNo', 'calibrationStatus'].some((field) => {
+    const prior = before?.[field] ?? null;
+    const next = after?.[field] ?? null;
+    return prior != null && prior !== '' && (next == null || next === '');
+  });
+}
+
+function isToolAuditEvent(event) {
+  const type = String(event?.eventType ?? '');
+  return type === 'TOOL_USED' || type === 'OPERATION_EVIDENCE_CLEARED' || type.includes('CLEAR') || type.includes('REPLACE');
+}
+
+function toolEventDrift(before, after, workOrderId) {
+  const owned = (events) => (events ?? []).filter((event) => {
+    if (!isToolAuditEvent(event)) return false;
+    if (event.workOrderId && workOrderId && event.workOrderId !== workOrderId) return false;
+    return true;
+  });
+  const prior = new Map(owned(before).filter((event) => event.id).map((event) => [event.id, event]));
+  const reasons = [];
+  for (const event of owned(after)) {
+    const old = event.id ? prior.get(event.id) : null;
+    if (!old) {
+      reasons.push(event.eventType + ' was added');
+      continue;
+    }
+    const signature = (item) => JSON.stringify({
+      type: item.eventType ?? null,
+      at: item.eventTime ?? null,
+      payload: item.payload ?? null,
+    });
+    if (signature(old) !== signature(event)) reasons.push(event.eventType + ' content changed');
+  }
+  return reasons;
+}
+
 const CAPTURE_EVENT = {
   data: 'DATA_CAPTURED',
   part: 'PART_CONSUMED',
@@ -417,8 +472,9 @@ export function judgeCancellationRace(observation) {
         const captureReason = assessCapture(kind, observation.oracle?.mutation, observation.captureBefore, observation.captureAfter, addedOrder, false);
         if (captureReason) reasons.push(captureReason);
         if (kind === 'tool') {
-          const scan = observation.captureAfter ?? {};
-          if (scan.toolInstanceId || scan.toolSerialNo || scan.calibrationStatus) reasons.push('losing tool capture left a scan');
+          reasons.push(...toolFieldDrift(observation.captureBefore, observation.captureAfter));
+          if (preparedToolRemoved(observation.captureBefore, observation.captureAfter)) reasons.push('prepared tool capture was removed');
+          reasons.push(...toolEventDrift(observation.auditBefore, observation.auditAfter, observation.workOrderId));
         }
       }
     } else if (actionWon) {
@@ -492,6 +548,13 @@ export function judgeRefusedStart(observation) {
     if (wo.startedAt) reasons.push('refused capture created startedAt');
     if (addedLife.some((event) => event.eventType === 'WORK_ORDER_STARTED')) reasons.push('refused capture wrote WORK_ORDER_STARTED');
     if (status < 400 || status >= 500) reasons.push('capture on a cancelled work order was not refused');
+  } else if (observation.oracle?.commentAttack) {
+    if (classifyNullDataWrite(observation.captureBefore) !== 'comment-attack') reasons.push('comment attack ran against empty DATA');
+    if ((observation.captureBefore?.text ?? null) !== (observation.oracle.expectedText ?? null)) reasons.push('comment attack did not start from the persisted text');
+    if (status < 400 || status >= 500) reasons.push('clear without a comment was accepted');
+    if ((beforeWo.status ?? null) !== (wo.status ?? null)) reasons.push('refused clear changed the work order status');
+    if ((beforeWo.startedAt ?? null) !== (wo.startedAt ?? null)) reasons.push('refused clear changed startedAt');
+    if (addedLife.some((event) => event.eventType === 'WORK_ORDER_STARTED')) reasons.push('refused clear wrote WORK_ORDER_STARTED');
   } else {
     if (beforeWo.status !== 'Ready') reasons.push('work order was ' + beforeWo.status + ' before the refused capture, expected Ready');
     if (status < 400 || status >= 500) reasons.push('invalid capture was accepted');
@@ -499,7 +562,10 @@ export function judgeRefusedStart(observation) {
     if (wo.startedAt) reasons.push('refused capture created startedAt');
     if (addedLife.some((event) => event.eventType === 'WORK_ORDER_STARTED')) reasons.push('refused capture wrote WORK_ORDER_STARTED');
   }
-  if (!sameCapture(observation.captureBefore, observation.captureAfter)) reasons.push('refused capture changed the evidence');
+  if (!sameCapture(observation.captureBefore, observation.captureAfter)) {
+    reasons.push(observation.oracle?.commentAttack ? 'persisted value changed' : 'refused capture changed the evidence');
+  }
+  if (business.some((event) => event.eventType === 'DATA_CAPTURED')) reasons.push('DATA_CAPTURED was added');
   if (business.length > 0) reasons.push('refused capture wrote a business event');
   if ((observation.before?.outcome ?? null) !== (observation.after?.outcome ?? null)) reasons.push('refused capture changed the signature');
   const errorIncludes = observation.oracle?.errorIncludes;

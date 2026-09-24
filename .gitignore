@@ -1,3 +1,7 @@
 node_modules/
 .env
-runs/
+# Journals can reach hundreds of MB. Ignore every run.
+# A deliberately small example may live under runs/examples/.
+runs/*
+!runs/examples/
+!runs/examples/**

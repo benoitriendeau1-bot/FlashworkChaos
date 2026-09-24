@@ -12,6 +12,11 @@ export const TOOL_CANCEL_RACE_REPEATS = 10;
 export const EXTRA_CANCEL_RACE_REPEATS = 2;
 /** One Ready work order per refused-start control, including the identity no-op. */
 export const REFUSED_START_WORK_ORDERS = 11;
+/**
+ * Planned head start, in milliseconds, between the favored commit and the other
+ * request. The value is part of the hashed plan. The runner does not choose it.
+ */
+export const RACE_COMMIT_BARRIER_MS = 400;
 
 const MISSING_ID = '00000000-0000-4000-8000-000000000000';
 const OTHER_ACTOR = '00000000-0000-4000-8000-000000000099';
@@ -535,6 +540,13 @@ export function signaturesCapturePlan(seed) {
       if (family.route === 'reopen') parallelAction.body = { comment: 'Chaos reopen contre annulation ' + (index + 1) };
       if (family.route === 'data') parallelAction.body = { capturedValueText: 'annulation-' + (index + 1) };
       if (family.route === 'part') parallelAction.body = { quantityActual: 1 };
+      const biased = family.key === 'data' || family.key === 'part' || family.key === 'tool';
+      const commitOrder = !biased ? null
+        : index < 2 ? 'cancel-first'
+          : index < 4 ? 'capture-first'
+            : 'simultaneous';
+      const captureDelay = commitOrder === 'cancel-first' ? RACE_COMMIT_BARRIER_MS : 0;
+      const cancelDelay = commitOrder === 'capture-first' ? RACE_COMMIT_BARRIER_MS : 0;
       push(act({
         id: 'cancel-vs-' + suffix,
         action: family.action,
@@ -544,14 +556,20 @@ export function signaturesCapturePlan(seed) {
         wo,
         requiresSkipReason: family.route === 'skip',
         requiresReopenReason: family.route === 'reopen',
-        parallel: [
-          parallelAction,
-          { route: 'cancel', body: { reason } },
-        ],
+        parallel: biased
+          ? [
+            { ...parallelAction, delayMs: captureDelay },
+            { route: 'cancel', delayMs: cancelDelay, body: { reason } },
+          ]
+          : [
+            parallelAction,
+            { route: 'cancel', body: { reason } },
+          ],
         oracle: {
           cancelVersus: family.route,
           initialStatus: family.initialStatus,
           reason,
+          ...(commitOrder ? { commitOrder } : {}),
         },
       }));
     }
@@ -681,9 +699,25 @@ export function signaturesCapturePlan(seed) {
     body: { quantityActual: -1 },
     oracle: { capture: 'part' },
   }));
-  push(noStart('rollback-comment', 'cancel-data', 'data', readyWo(), {
+  const commentWo = readyWo();
+  push(act({
+    id: 'prepare-rollback-comment',
+    action: 'pass',
+    slot: 'cancel-data',
+    kind: 'edge',
+    route: 'data',
+    wo: commentWo,
+    body: { capturedValueText: 'commentaire-avant' },
+    oracle: { http: [200], accept: true, siblingsUnchanged: false, capture: 'data' },
+  }));
+  push(noStart('rollback-comment', 'cancel-data', 'data', commentWo, {
     body: { capturedValueText: null },
-    oracle: { capture: 'data' },
+    oracle: {
+      capture: 'data',
+      commentAttack: true,
+      expectedText: 'commentaire-avant',
+      errorIncludes: 'Comment is required',
+    },
   }));
   push(noStart('rollback-wrong-requirement', 'ordered-operator', 'pass', readyWo(), {
     foreign: 'step',

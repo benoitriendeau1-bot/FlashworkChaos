@@ -6,8 +6,8 @@ import { compileScenarios } from '../src/scenario.mjs';
 import { partsCapturePlan } from '../src/parts-plan.mjs';
 import { toolsCapturePlan } from '../src/tools-plan.mjs';
 import { redactSecrets } from '../src/signatures-redact.mjs';
-import { judgeCancellationRace, judgeIdentityNoop, judgeRefusedStart, judgeSignatureObservation, recordSignatureOutcome, emptySignatureCounters, signatureVerdict } from '../src/signatures-judge.mjs';
-import { CANCEL_RACE_REPEATS, EXTRA_CANCEL_RACE_REPEATS, REFUSED_START_WORK_ORDERS, SIGN_RACE_REPEATS, TOOL_CANCEL_RACE_REPEATS, bindSignaturesPlan, signaturesCapturePlan, signaturesPlanHash } from '../src/signatures-plan.mjs';
+import { classifyNullDataWrite, judgeCancellationRace, judgeIdentityNoop, judgeRefusedStart, judgeSignatureObservation, recordSignatureOutcome, emptySignatureCounters, signatureVerdict } from '../src/signatures-judge.mjs';
+import { CANCEL_RACE_REPEATS, EXTRA_CANCEL_RACE_REPEATS, RACE_COMMIT_BARRIER_MS, REFUSED_START_WORK_ORDERS, SIGN_RACE_REPEATS, TOOL_CANCEL_RACE_REPEATS, bindSignaturesPlan, signaturesCapturePlan, signaturesPlanHash } from '../src/signatures-plan.mjs';
 import { resolveWorkOrderIds } from '../src/wo-resolve.mjs';
 
 const secret = 'super-secret-password';
@@ -441,6 +441,26 @@ test('cancellation races are planned five times before any HTTP call', () => {
   assert.equal(prepare.wo, live.wo);
   const tools = plan.actions.filter((action) => /^cancel-vs-tool-\d+$/.test(action.id));
   assert.equal(tools.length, TOOL_CANCEL_RACE_REPEATS);
+  for (const family of ['data', 'part', 'tool']) {
+    const races = plan.actions.filter((action) => new RegExp('^cancel-vs-' + family + '-\\d+$').test(action.id));
+    assert.equal(races.filter((action) => action.oracle.commitOrder === 'cancel-first').length >= 2, true, family);
+    assert.equal(races.filter((action) => action.oracle.commitOrder === 'capture-first').length >= 2, true, family);
+    const cancelFirst = races.find((action) => action.oracle.commitOrder === 'cancel-first');
+    const captureFirst = races.find((action) => action.oracle.commitOrder === 'capture-first');
+    assert.equal(cancelFirst.parallel[0].delayMs, RACE_COMMIT_BARRIER_MS);
+    assert.equal(cancelFirst.parallel[1].delayMs, 0);
+    assert.equal(captureFirst.parallel[0].delayMs, 0);
+    assert.equal(captureFirst.parallel[1].delayMs, RACE_COMMIT_BARRIER_MS);
+  }
+  const commentPrepare = plan.actions.find((action) => action.id === 'prepare-rollback-comment');
+  const commentAttack = plan.actions.find((action) => action.id === 'rollback-comment');
+  assert.equal(commentPrepare.body.capturedValueText, 'commentaire-avant');
+  assert.equal(commentPrepare.wo, commentAttack.wo);
+  assert.ok(plan.actions.indexOf(commentPrepare) < plan.actions.indexOf(commentAttack));
+  assert.equal(commentAttack.body.capturedValueText, null);
+  assert.equal(commentAttack.body.comment, undefined);
+  assert.equal(commentAttack.oracle.commentAttack, true);
+  assert.equal(commentAttack.oracle.expectedText, 'commentaire-avant');
   assert.equal(plan.slots.find((slot) => slot.key === 'cancel-part-unit').serialUnits, true);
   const unitRaces = plan.actions.filter((action) => /^cancel-vs-part-unit-\d+$/.test(action.id));
   assert.deepEqual(unitRaces.map((action) => action.parallel[0].body.serialNo), ['SN-ANNUL-U1', 'SN-ANNUL-U2']);
@@ -622,6 +642,138 @@ test('a cancelled work order cannot be reactivated by a later pass', () => {
   assert.equal(toolCancel.winner, 'cancellation');
 });
 
+function preparedTool() {
+  return {
+    toolInstanceId: 'inst-1',
+    assetTag: 'TAG-ESSAI031-SIG',
+    serialNo: 'TAG-ESSAI031-SIG',
+    toolSerialNo: 'TAG-ESSAI031-SIG',
+    calibrationStatus: 'Pass',
+    captureStatus: null,
+    useQty: 1,
+    calibrationCheckedAt: null,
+    lastCalibratedAt: null,
+    calibrationDueDate: null,
+    usedBy: 'user-1',
+    usedAt: '2026-09-23T19:00:00.000Z',
+    toolId: 'tool-1',
+    toolNumber: 'TESSAI031SIG',
+    capturePolicy: 'required',
+  };
+}
+
+function preparedToolRace(mutation, afterCapture, extraAudit = []) {
+  const toolEvent = {
+    id: 't0',
+    eventType: 'TOOL_USED',
+    eventTime: '2026-09-23T19:00:00.000Z',
+    workOrderId: 'wo-1',
+    payload: { toolInstanceId: 'inst-1', toolSerialNo: 'TAG-ESSAI031-SIG', calibrationStatus: 'Pass' },
+  };
+  return cancelObservation({
+    oracle: { cancelVersus: 'tool', mutation, initialStatus: 'InProgress', reason: 'Chaos annulation pass-ready-1' },
+    woBefore: { status: 'InProgress', startedAt: '2026-09-23T19:00:00.000Z', cancelledAt: null, cancelReason: null, currentVarianceId: 'var-1' },
+    woAfter: { status: 'Cancelled', startedAt: '2026-09-23T19:00:00.000Z', cancelledAt: '2026-09-23T20:00:00.000Z', cancelReason: 'Chaos annulation pass-ready-1', currentVarianceId: 'var-1' },
+    captureBefore: preparedTool(),
+    captureAfter: afterCapture,
+    auditBefore: [toolEvent],
+    auditAfter: [
+      toolEvent,
+      { id: 'c1', eventType: 'WORK_ORDER_CANCELLED', eventTime: '2026-09-23T20:00:00.000Z', workOrderId: 'wo-1' },
+      ...extraAudit,
+    ],
+  });
+}
+
+test('a refused clear or replace keeps the tool captured before the race', () => {
+  const clear = judgeCancellationRace(preparedToolRace('clear', preparedTool()));
+  assert.equal(clear.finding, false);
+  assert.equal(clear.winner, 'cancellation');
+  const replace = judgeCancellationRace(preparedToolRace('replace', preparedTool()));
+  assert.equal(replace.finding, false);
+  assert.equal(replace.winner, 'cancellation');
+  const instance = judgeCancellationRace(preparedToolRace('clear', { ...preparedTool(), toolInstanceId: 'inst-2' }));
+  assert.equal(instance.finding, true);
+  assert.match(instance.invariant, /toolInstanceId changed/);
+  const serial = judgeCancellationRace(preparedToolRace('replace', { ...preparedTool(), toolSerialNo: 'OTHER' }));
+  assert.equal(serial.finding, true);
+  assert.match(serial.invariant, /toolSerialNo changed/);
+  const calibration = judgeCancellationRace(preparedToolRace('clear', { ...preparedTool(), calibrationStatus: 'Fail' }));
+  assert.equal(calibration.finding, true);
+  assert.match(calibration.invariant, /calibrationStatus changed/);
+  const added = judgeCancellationRace(preparedToolRace('clear', preparedTool(), [{
+    id: 't1',
+    eventType: 'TOOL_USED',
+    eventTime: '2026-09-23T19:59:59.000Z',
+    workOrderId: 'wo-1',
+    payload: { clear: true },
+  }]));
+  assert.equal(added.finding, true);
+  assert.match(added.invariant, /TOOL_USED was added/);
+  const removed = judgeCancellationRace(preparedToolRace('clear', {
+    ...preparedTool(),
+    toolInstanceId: null,
+    toolSerialNo: null,
+    calibrationStatus: null,
+  }));
+  assert.equal(removed.finding, true);
+  assert.match(removed.invariant, /prepared tool capture was removed/);
+});
+
+function commentAttackObservation(overrides) {
+  return {
+    status: 400,
+    errorText: 'Comment is required for CLEAR_VALUE on capturedValueText',
+    audited: true,
+    oracle: {
+      noStart: true,
+      commentAttack: true,
+      expectedText: 'commentaire-avant',
+      errorIncludes: 'Comment is required',
+      capture: 'data',
+    },
+    before: row(),
+    after: row(),
+    woBefore: { status: 'InProgress', startedAt: '2026-09-23T20:00:00.000Z' },
+    woAfter: { status: 'InProgress', startedAt: '2026-09-23T20:00:00.000Z' },
+    workOrderId: 'wo-1',
+    auditBefore: [
+      { id: 's1', eventType: 'WORK_ORDER_STARTED', eventTime: '2026-09-23T20:00:00.000Z', workOrderId: 'wo-1' },
+      { id: 'd0', eventType: 'DATA_CAPTURED', eventTime: '2026-09-23T20:00:00.100Z', workOrderId: null },
+    ],
+    auditAfter: [
+      { id: 's1', eventType: 'WORK_ORDER_STARTED', eventTime: '2026-09-23T20:00:00.000Z', workOrderId: 'wo-1' },
+      { id: 'd0', eventType: 'DATA_CAPTURED', eventTime: '2026-09-23T20:00:00.100Z', workOrderId: null },
+    ],
+    captureBefore: { text: 'commentaire-avant', number: null, status: 'Captured' },
+    captureAfter: { text: 'commentaire-avant', number: null, status: 'Captured' },
+    ...overrides,
+  };
+}
+
+test('a null write is a first capture on empty DATA and a comment attack after a stored value', () => {
+  assert.equal(classifyNullDataWrite({ text: null, status: 'Pending' }), 'first-capture');
+  assert.equal(classifyNullDataWrite({ capturedValueText: null }), 'first-capture');
+  assert.equal(classifyNullDataWrite({ text: 'commentaire-avant', status: 'Captured' }), 'comment-attack');
+  const kept = judgeRefusedStart(commentAttackObservation());
+  assert.equal(kept.finding, false);
+  assert.equal(kept.outcome, 'correctly-rejected');
+  const cleared = judgeRefusedStart(commentAttackObservation({
+    captureAfter: { text: null, number: null, status: 'Captured' },
+  }));
+  assert.equal(cleared.finding, true);
+  assert.match(cleared.invariant, /persisted value changed/);
+  const eventAdded = judgeRefusedStart(commentAttackObservation({
+    auditAfter: [
+      { id: 's1', eventType: 'WORK_ORDER_STARTED', eventTime: '2026-09-23T20:00:00.000Z', workOrderId: 'wo-1' },
+      { id: 'd0', eventType: 'DATA_CAPTURED', eventTime: '2026-09-23T20:00:00.100Z', workOrderId: null },
+      { id: 'd1', eventType: 'DATA_CAPTURED', eventTime: '2026-09-23T20:00:01.000Z', workOrderId: null },
+    ],
+  }));
+  assert.equal(eventAdded.finding, true);
+  assert.match(eventAdded.invariant, /DATA_CAPTURED was added/);
+});
+
 test('a refused capture must not start the work order, and an unsent serial unit is not coverage', () => {
   const refused = judgeRefusedStart({
     status: 400,
@@ -676,6 +828,32 @@ test('a refused capture must not start the work order, and an unsent serial unit
   assert.equal(noop.finding, false);
   assert.equal(noop.outcome, 'contract-decision');
   assert.match(noop.decision, /contractDecisionRequired/);
+});
+
+test('catalog numbers stay isolated across slices for the same run token', () => {
+  const token = 'ESSAI031';
+  const parts = ['NNN', 'SER', 'SUN', 'LOT', 'LLN', 'HEA', 'HLN', 'LHE', 'LHL', 'SLO', 'SHE', 'SLH', 'GAT'].map((code) => 'P' + token + code);
+  const lifecycleParts = ['NN', 'SE', 'LO', 'HE', 'LL'].map((code) => 'P' + token + code);
+  const manufacturingParts = [1, 2, 3, 4, 5, 6, 7].map((index) => 'P' + token + String(index).padStart(3, '0'));
+  const signatureParts = ['SIG', 'SIGS', 'SIGL'].map((code) => 'P' + token + code);
+  const tools = ['REQ', 'OPT', 'INF', 'OTH', 'GAT', 'OBS'].map((code) => 'T' + token + code);
+  const lifecycleTools = ['RQ', 'OP', 'IN', 'R2'].map((code) => 'T' + token + code);
+  const manufacturingTools = [1, 2, 3, 4, 5, 6, 7, 8].map((index) => 'T' + token + String(index).padStart(3, '0'));
+  const signatureTools = ['SIG', 'SIGO'].map((code) => 'T' + token + code);
+  const tags = [
+    ...['REQ-A', 'REQ-B', 'REQ-X', 'OPT-A', 'INF-A', 'OTH-A', 'GAT-A', 'OBS-A'].map((suffix) => 'TAG-' + token + '-' + suffix),
+    ...['REQ', 'OPT', 'INF', 'RQ2'].map((suffix) => 'TAG-' + token + '-' + suffix),
+    ...['SIG', 'SIGB', 'SIGX', 'OBSIG'].map((suffix) => 'TAG-' + token + '-' + suffix),
+  ];
+  const masters = ['0001', 'PART', 'TOOL', 'LC', 'SIG'].map((suffix) => 'MI-CH' + token + suffix);
+  const orders = ['0001', 'P1', 'T1', 'L1', 'S1'].map((suffix) => 'POCH' + token + suffix);
+  for (const group of [parts.concat(lifecycleParts, manufacturingParts, signatureParts), tools.concat(lifecycleTools, manufacturingTools, signatureTools), tags, masters, orders]) {
+    assert.equal(new Set(group).size, group.length, group.join(','));
+  }
+  assert.equal(signatureTools.includes('T' + token + 'OBS'), false);
+  const source = readFileSync(new URL('../src/signatures-run.mjs', import.meta.url), 'utf8');
+  assert.match(source, /toolNumber: 'T' \+ token \+ 'SIGO'/);
+  assert.equal(source.includes("toolNumber: 'T' + token + 'OBS'"), false);
 });
 
 test('DATA, parts and tools plans stay unchanged by the signature plan', () => {

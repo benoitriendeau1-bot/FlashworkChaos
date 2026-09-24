@@ -17,6 +17,16 @@ import { summarizeSignaturesPlan, signaturesCapturePlan } from './signatures-pla
 import { runSignaturesCapture } from './signatures-run.mjs';
 import { lifecyclePlan, summarizeLifecyclePlan } from './lifecycle-plan.mjs';
 import { runLifecycle } from './lifecycle-run.mjs';
+import { andonPlan, summarizeAndonPlan } from './andon-plan.mjs';
+import { runAndonCapture } from './andon-run.mjs';
+import { ncrPlan, summarizeNcrPlan } from './ncr-plan.mjs';
+import { runNcrCapture } from './ncr-run.mjs';
+import { summarizeVariancePlan, variancePlan } from './variance-plan.mjs';
+import { runVarianceCapture } from './variance-run.mjs';
+import { runPlan, summarizeRunPlan } from './run-plan.mjs';
+import { runRunCapture } from './run-run.mjs';
+import { serviceVisitPlan, summarizeServiceVisitPlan } from './service-visit-plan.mjs';
+import { runServiceVisitCapture } from './service-visit-run.mjs';
 import path from 'node:path';
 
 const arg = (name, fallback) => {
@@ -54,6 +64,16 @@ if (process.argv.includes('--dry-run')) {
     signaturesByAction: signaturesPlan.byAction,
     lifecyclePlanHash: summarizeLifecyclePlan(lifecyclePlan(seed)).lifecyclePlanHash,
     lifecycleActions: summarizeLifecyclePlan(lifecyclePlan(seed)).actionCount,
+    andonPlanHash: summarizeAndonPlan(andonPlan(seed)).andonPlanHash,
+    andonActions: summarizeAndonPlan(andonPlan(seed)).actionCount,
+    ncrPlanHash: summarizeNcrPlan(ncrPlan(seed)).ncrPlanHash,
+    ncrActions: summarizeNcrPlan(ncrPlan(seed)).actionCount,
+    variancePlanHash: summarizeVariancePlan(variancePlan(seed)).variancePlanHash,
+    varianceActions: summarizeVariancePlan(variancePlan(seed)).actionCount,
+    runPlanHash: summarizeRunPlan(runPlan(seed)).runPlanHash,
+    runActions: summarizeRunPlan(runPlan(seed)).actionCount,
+    serviceVisitPlanHash: summarizeServiceVisitPlan(serviceVisitPlan(seed)).serviceVisitPlanHash,
+    serviceVisitActions: summarizeServiceVisitPlan(serviceVisitPlan(seed)).actionCount,
     captureBlocked: capturePlan.blockedTypes,
     violations: planViolations,
     scenarios: compiled.scenarios.map(summarizeScenario),
@@ -78,6 +98,32 @@ const prefix = arg('prefix', 'CH');
 if (!/^[A-Z]{2,5}$/.test(prefix)) throw new Error('prefix must be 2–5 uppercase letters');
 const bound = bindPlan(compiled, { prefix, runId });
 const output = reportWriter(path.resolve('runs', runId), seed);
+let reportClosed = false;
+function closeReport(summary) {
+  if (reportClosed) return;
+  reportClosed = true;
+  output.finish(summary);
+}
+function fatalReport(error) {
+  const text = error instanceof Error ? (error.stack || error.message) : String(error);
+  const summary = {
+    seed, runId, prefix, count,
+    planHash: compiled.planHash,
+    fatal: true,
+    pass: false,
+    error: text,
+  };
+  try {
+    output.write({ label: 'FATAL', seed, runId, prefix, error: text });
+    closeReport(summary);
+  } catch (writeError) {
+    console.error(writeError);
+  }
+  console.error(text);
+  process.exit(1);
+}
+process.on('unhandledRejection', fatalReport);
+process.on('uncaughtException', fatalReport);
 const totals = {
   masterItems: 0, operations: 0, steps: 0, numericData: 0, textData: 0,
   productionOrders: 0, workOrders: 0, negativeChecks: 0, findings: 0, blocked: 0,
@@ -492,12 +538,146 @@ lifecycleReport = await runLifecycle({
   seed, runId, prefix, effectivityDate, envUserId: user,
   foreignOrderNo: bound.scenarios[0]?.orderNo ?? null,
 });
+let andonReport = null;
+andonReport = await runAndonCapture({
+  setup: async (label, method, route, body) => {
+    const seq = ++action;
+    try {
+      const result = await api.call(method, route, body);
+      output.write({ seq, label, method, route, body: redactSecrets(body), status: result.status, response: redactSecrets(result.data), ok: result.status >= 200 && result.status < 300, phase: 'andon-setup' });
+      return { ...result, ok: result.status >= 200 && result.status < 300 };
+    } catch (error) {
+      output.write({ seq, label, method, route, body: redactSecrets(body), error: String(error), ok: false, phase: 'andon-setup' });
+      return { ok: false, status: 0, data: { error: String(error) } };
+    }
+  },
+  call: async (label, method, route, body, options) => {
+    const seq = ++action;
+    try {
+      const result = await api.call(method, route, body, options);
+      output.write({ seq, label, method, route, body: redactSecrets(body), status: result.status, response: redactSecrets(result.data), phase: 'andon', actor: options?.userId ?? user });
+      return { seq, status: result.status, data: result.data };
+    } catch (error) {
+      output.write({ seq, label, method, route, body: redactSecrets(body), error: String(error), phase: 'andon' });
+      return { seq, status: 0, data: { error: String(error) } };
+    }
+  },
+  seed, runId, prefix, effectivityDate, envUserId: user,
+});
+let ncrReport = null;
+ncrReport = await runNcrCapture({
+  setup: async (label, method, route, body) => {
+    const seq = ++action;
+    try {
+      const result = await api.call(method, route, body);
+      output.write({ seq, label, method, route, body: redactSecrets(body), status: result.status, response: redactSecrets(result.data), ok: result.status >= 200 && result.status < 300, phase: 'ncr-setup' });
+      return { ...result, ok: result.status >= 200 && result.status < 300 };
+    } catch (error) {
+      output.write({ seq, label, method, route, body: redactSecrets(body), error: String(error), ok: false, phase: 'ncr-setup' });
+      return { ok: false, status: 0, data: { error: String(error) } };
+    }
+  },
+  call: async (label, method, route, body, options) => {
+    const seq = ++action;
+    try {
+      const result = await api.call(method, route, body, options);
+      output.write({ seq, label, method, route, body: redactSecrets(body), status: result.status, response: redactSecrets(result.data), phase: 'ncr', actor: options?.userId ?? user });
+      return { seq, status: result.status, data: result.data };
+    } catch (error) {
+      output.write({ seq, label, method, route, body: redactSecrets(body), error: String(error), phase: 'ncr' });
+      return { seq, status: 0, data: { error: String(error) } };
+    }
+  },
+  seed, runId, prefix, effectivityDate, envUserId: user,
+});
+let varianceReport = null;
+varianceReport = await runVarianceCapture({
+  setup: async (label, method, route, body) => {
+    const seq = ++action;
+    try {
+      const result = await api.call(method, route, body);
+      output.write({ seq, label, method, route, body: redactSecrets(body), status: result.status, response: redactSecrets(result.data), ok: result.status >= 200 && result.status < 300, phase: 'variance-setup' });
+      return { ...result, ok: result.status >= 200 && result.status < 300 };
+    } catch (error) {
+      output.write({ seq, label, method, route, body: redactSecrets(body), error: String(error), ok: false, phase: 'variance-setup' });
+      return { ok: false, status: 0, data: { error: String(error) } };
+    }
+  },
+  call: async (label, method, route, body, options) => {
+    const seq = ++action;
+    try {
+      const result = await api.call(method, route, body, options);
+      output.write({ seq, label, method, route, body: redactSecrets(body), status: result.status, response: redactSecrets(result.data), phase: 'variance', actor: options?.userId ?? user });
+      return { seq, status: result.status, data: result.data };
+    } catch (error) {
+      output.write({ seq, label, method, route, body: redactSecrets(body), error: String(error), phase: 'variance' });
+      return { seq, status: 0, data: { error: String(error) } };
+    }
+  },
+  seed, runId, prefix, effectivityDate, envUserId: user,
+});
+let runReport = null;
+runReport = await runRunCapture({
+  setup: async (label, method, route, body) => {
+    const seq = ++action;
+    try {
+      const result = await api.call(method, route, body);
+      output.write({ seq, label, method, route, body: redactSecrets(body), status: result.status, response: redactSecrets(result.data), ok: result.status >= 200 && result.status < 300, phase: 'run-setup' });
+      return { ...result, ok: result.status >= 200 && result.status < 300 };
+    } catch (error) {
+      output.write({ seq, label, method, route, body: redactSecrets(body), error: String(error), ok: false, phase: 'run-setup' });
+      return { ok: false, status: 0, data: { error: String(error) } };
+    }
+  },
+  call: async (label, method, route, body, options) => {
+    const seq = ++action;
+    try {
+      const result = await api.call(method, route, body, options);
+      output.write({ seq, label, method, route, body: redactSecrets(body), status: result.status, response: redactSecrets(result.data), phase: 'run', actor: options?.userId ?? user });
+      return { seq, status: result.status, data: result.data };
+    } catch (error) {
+      output.write({ seq, label, method, route, body: redactSecrets(body), error: String(error), phase: 'run' });
+      return { seq, status: 0, data: { error: String(error) } };
+    }
+  },
+  seed, runId, prefix, effectivityDate, envUserId: user,
+});
+let serviceVisitReport = null;
+serviceVisitReport = await runServiceVisitCapture({
+  setup: async (label, method, route, body) => {
+    const seq = ++action;
+    try {
+      const result = await api.call(method, route, body);
+      output.write({ seq, label, method, route, body: redactSecrets(body), status: result.status, response: redactSecrets(result.data), ok: result.status >= 200 && result.status < 300, phase: 'service-visit-setup' });
+      return { ...result, ok: result.status >= 200 && result.status < 300 };
+    } catch (error) {
+      output.write({ seq, label, method, route, body: redactSecrets(body), error: String(error), ok: false, phase: 'service-visit-setup' });
+      return { ok: false, status: 0, data: { error: String(error) } };
+    }
+  },
+  call: async (label, method, route, body, options) => {
+    const seq = ++action;
+    try {
+      const result = await api.call(method, route, body, options);
+      output.write({ seq, label, method, route, body: redactSecrets(body), status: result.status, response: redactSecrets(result.data), phase: 'service-visit', actor: options?.userId ?? user });
+      return { seq, status: result.status, data: result.data };
+    } catch (error) {
+      output.write({ seq, label, method, route, body: redactSecrets(body), error: String(error), phase: 'service-visit' });
+      return { seq, status: 0, data: { error: String(error) } };
+    }
+  },
+  seed, runId, prefix, effectivityDate, envUserId: user,
+});
 const notCovered = [
   ...(partsReport?.pass === true ? [] : ['partCapture']),
   ...(toolsReport?.pass === true ? [] : ['toolCapture']),
   ...(signaturesReport?.pass === true ? [] : ['signoffChaos']),
   ...(lifecycleReport?.executionPass === true ? [] : ['toolExecution']),
-  'run2Plus', 'sv2Plus', 'andon', 'ncr', 'variance',
+  ...(andonReport?.pass === true ? [] : ['andon']),
+  ...(ncrReport?.pass === true ? [] : ['ncr']),
+  ...(varianceReport?.pass === true ? [] : ['variance']),
+  ...(runReport?.pass === true ? [] : ['run2Plus']),
+  ...(serviceVisitReport?.pass === true ? [] : ['sv2Plus']),
 ];
 const minimum = {
   operations: 3 * count, numericData: count, negativeChecks: count,
@@ -540,6 +720,11 @@ const summary = {
   signatures: signaturesReport,
   cancellationRaces: signaturesReport?.cancellationRaces ?? null,
   workOrderLifecycle: lifecycleReport,
+  andon: andonReport,
+  ncr: ncrReport,
+  variance: varianceReport,
+  run: runReport,
+  serviceVisit: serviceVisitReport,
   setupPass,
   capturePass,
   chaosPass,
@@ -557,8 +742,22 @@ const summary = {
   workOrderCompletionPass: lifecycleReport?.completionPass === true,
   asBuiltPass: lifecycleReport?.asBuiltPass === true,
   lifecycleChaosPass: lifecycleReport?.chaosPass === true,
-  pass: setupPass && dataPass && partsCapturePass && partsChaosPass && toolsReport?.capturePass === true && toolsReport?.chaosPass === true && signaturesReport?.capturePass === true && signaturesReport?.chaosPass === true && lifecycleReport?.pass === true,
+  andonCapturePass: andonReport?.capturePass === true,
+  andonChaosPass: andonReport?.chaosPass === true,
+  andonPass: andonReport?.capturePass === true && andonReport?.chaosPass === true,
+  ncrCapturePass: ncrReport?.capturePass === true,
+  ncrChaosPass: ncrReport?.chaosPass === true,
+  ncrPass: ncrReport?.capturePass === true && ncrReport?.chaosPass === true,
+  varianceCapturePass: varianceReport?.capturePass === true,
+  varianceChaosPass: varianceReport?.chaosPass === true,
+  variancePass: varianceReport?.capturePass === true && varianceReport?.chaosPass === true,
+  runCapturePass: runReport?.capturePass === true,
+  runChaosPass: runReport?.chaosPass === true,
+  runPass: runReport?.capturePass === true && runReport?.chaosPass === true,
+  serviceVisitCapturePass: serviceVisitReport?.capturePass === true,
+  serviceVisitChaosPass: serviceVisitReport?.chaosPass === true,
+  pass: setupPass && dataPass && partsCapturePass && partsChaosPass && toolsReport?.capturePass === true && toolsReport?.chaosPass === true && signaturesReport?.capturePass === true && signaturesReport?.chaosPass === true && lifecycleReport?.pass === true && andonReport?.capturePass === true && andonReport?.chaosPass === true && ncrReport?.capturePass === true && ncrReport?.chaosPass === true && varianceReport?.capturePass === true && varianceReport?.chaosPass === true && runReport?.capturePass === true && runReport?.chaosPass === true && serviceVisitReport?.capturePass === true && serviceVisitReport?.chaosPass === true,
 };
-output.finish(summary);
+closeReport(summary);
 console.log(JSON.stringify(summary, null, 2));
 process.exitCode = summary.pass ? 0 : 1;

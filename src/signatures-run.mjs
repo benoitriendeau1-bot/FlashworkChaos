@@ -488,12 +488,17 @@ export async function runSignaturesCapture({
       };
     }
     if (kind === 'tool') {
-      const toolRow = located?.step?.tools?.[0];
-      return {
-        toolInstanceId: toolRow?.toolInstanceId ?? null,
-        toolSerialNo: toolRow?.toolSerialNo ?? null,
-        calibrationStatus: toolRow?.calibrationStatus ?? null,
-      };
+      const toolRow = located?.step?.tools?.[0] ?? {};
+      const rawTools = rawStep(located?.wo, located?.step?.proOpeStepId)?.tools ?? [];
+      const raw = rawTools.find((tool) => tool?.proStepToolId === toolRow.proStepToolId) ?? rawTools[0] ?? {};
+      const source = { ...raw, ...toolRow };
+      const snapshot = {};
+      for (const field of [
+        'toolInstanceId', 'assetTag', 'serialNo', 'toolSerialNo', 'calibrationStatus', 'captureStatus',
+        'useQty', 'calibrationCheckedAt', 'lastCalibratedAt', 'calibrationDueDate', 'usedBy', 'usedAt',
+        'toolId', 'toolNumber', 'capturePolicy',
+      ]) snapshot[field] = source[field] ?? null;
+      return snapshot;
     }
     if (kind === 'identity') {
       const identity = rawStep(located?.wo, located?.step?.proOpeStepId)?.unitIdentity ?? null;
@@ -604,6 +609,8 @@ export async function runSignaturesCapture({
     const targets = action.parallel ?? [{ route: action.route, actor: action.actor, body: action.body, slot: action.slot }];
     let arrival = 0;
     const calls = await Promise.all(targets.map(async (item, index) => {
+      const waitMs = Number(item.delayMs ?? 0);
+      if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
       const target = locate(item.slot ?? action.slot, woNumber, workOrders);
       const routeName = item.route ?? action.route;
       const response = await send(routeName, action, item, target, index, woNumber);
@@ -676,6 +683,8 @@ export async function runSignaturesCapture({
           cancelVersus: action.oracle.cancelVersus,
           family: action.id.startsWith('cancel-vs-') ? action.id.replace(/^cancel-vs-/, '').replace(/-\d+$/, '') : 'pass-ready-legacy',
           plannedOrder: (action.parallel ?? []).map((item) => item.route ?? action.route),
+          commitOrder: action.oracle?.commitOrder ?? 'simultaneous',
+          delayMs: (action.parallel ?? []).map((item) => Number(item.delayMs ?? 0)),
           messages: observation.errors,
           before: { wo: observation.woBefore, unit: observation.unitBefore, po: observation.poBefore },
           after: { wo: observation.woAfter, unit: observation.unitAfter, po: observation.poAfter },
