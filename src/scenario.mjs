@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { integer, rng, snapshotFacts } from './engine.mjs';
+import { integer, normalizeInstructionText, rng, snapshotFacts } from './engine.mjs';
 import {
   CONSUMABLE_MODES, DATA_ROLES, ENUM_SETS, FAMILIES, LOT_MODES, PART_ROLES, SERIAL_MODES, TOOL_ROLES,
 } from './manufacturing.mjs';
@@ -460,7 +460,8 @@ export function diffScenario(scenario, detail, options = {}) {
       if (observed.operationTitle && observed.operationTitle !== operation.title) {
         differences.push({ severity: 'material', reason: 'operation title differs', ids: { ...ids, planned: operation.title, observed: observed.operationTitle } });
       }
-      if (!observed.texts.some((text) => text.includes(step.instruction))) {
+      const plannedInstruction = normalizeInstructionText(step.instruction);
+      if (!observed.texts.some((text) => text === plannedInstruction)) {
         differences.push({ severity: 'material', reason: 'instruction text missing on read-back', ids });
       }
       if (observed.signoffCount < 1) differences.push({ severity: 'material', reason: 'step has no sign-off', ids });

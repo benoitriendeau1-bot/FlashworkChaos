@@ -1,4 +1,5 @@
 node_modules/
+dashboard/web/dist/
 .env
 # Journals can reach hundreds of MB. Ignore every run.
 # A deliberately small example may live under runs/examples/.

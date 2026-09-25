@@ -1,0 +1,3 @@
+{"seq":1,"phase":"capture","label":"numeric-nominal","method":"PATCH","status":200,"body":{"capturedValueNumber":"15.0000","capturedValueText":"15.0000"},"response":{}}
+{"seq":2,"phase":"capture","label":"mystery-action","status":200,"response":{}}
+{"seq":3,"phase":"capture","label":"reread WO","status":200,"response":

@@ -1,5 +1,8 @@
 import { dataCapturePlan } from './capture-plan.mjs';
-import { captureVerdict, emptyCaptureCounters, emptyTypeCounters, judgeObservation, recordOutcome } from './capture-judge.mjs';
+import { stableStringify } from './scenario.mjs';
+import {
+  captureVerdict, emptyCaptureCounters, emptyTypeCounters, judgeObservation, othersUnchanged, recordOutcome, targetRow,
+} from './capture-judge.mjs';
 import { captureFingerprint, findStep, resolveWorkOrderIds } from './wo-resolve.mjs';
 
 const TYPE_KEY = { numeric: 'number', number: 'number', text: 'text', boolean: 'boolean', date: 'date', enum: 'enum' };
@@ -43,6 +46,7 @@ export async function runDataCapture({ call, readDetail, scenario, catalog, orde
   };
   const findings = [];
   const concurrency = [];
+  const proofs = [];
   const base = { seed, runId, orderNo, workOrderId, capturePlanHash: plan.capturePlanHash };
   let setupOk = true;
   let cancelOk = false;
@@ -87,7 +91,7 @@ export async function runDataCapture({ call, readDetail, scenario, catalog, orde
       invariant: resolved.error,
       expected: 'work order detail with proOpeStepId and proStepDataId',
     }));
-    return { ...captureVerdict(counters), counters, findings, concurrency, capturePlanHash: plan.capturePlanHash };
+    return { ...captureVerdict(counters), counters, findings, concurrency, proofs, capturePlanHash: plan.capturePlanHash };
   }
 
   function locatorIds(locator) {
@@ -103,10 +107,34 @@ export async function runDataCapture({ call, readDetail, scenario, catalog, orde
     return captureFingerprint(resolved);
   }
 
+  function remember(action, info) {
+    const before = info.before;
+    const after = info.after;
+    const comparable = Array.isArray(before) && Array.isArray(after);
+    proofs.push({
+      actionId: action.id,
+      executed: info.executed !== false,
+      seqs: info.seqs ?? [],
+      status: info.status ?? null,
+      method: info.method ?? null,
+      route: info.route ?? null,
+      body: info.body ?? null,
+      errorText: info.errorText ?? null,
+      outcome: info.outcome ?? null,
+      invariant: info.invariant ?? null,
+      beforeRow: targetRow(before, action.locator),
+      afterRow: targetRow(after, action.locator),
+      changed: comparable ? stableStringify(before) !== stableStringify(after) : null,
+      othersUnchanged: comparable ? othersUnchanged(before, after, action.locator ?? null) : null,
+      historyUnchanged: info.historyUnchanged ?? null,
+    });
+  }
+
   function blockedCall(action, reason) {
     const judgment = { outcome: 'blocked', finding: true, invariant: reason };
     note(action, judgment, false);
     findings.push(finding(base, action, { expected: action.oracle ?? action.id, invariant: reason }));
+    remember(action, { executed: false, outcome: judgment.outcome, invariant: reason });
     if (action.phase === 'setup') setupOk = false;
     return null;
   }
@@ -184,20 +212,32 @@ export async function runDataCapture({ call, readDetail, scenario, catalog, orde
         action: response.seq, request: { method, route, body }, response: { status: response.status, body: response.data },
         expected: oracle, before, after: null, invariant: resolved.error,
       }));
+      remember(action, {
+        seqs: response.seq == null ? [] : [response.seq],
+        status: response.status, method, route, body, errorText: errorText(response.data),
+        outcome: judgment.outcome, invariant: judgment.invariant, before, after: null,
+      });
       return;
     }
     let judgment = judgeObservation({
       oracle, status: response.status, before, after, locator: action.locator, forcedBlocked, errorText: errorText(response.data),
     });
+    let historyUnchanged = null;
     if (oracle?.historyUnchanged && historyBefore != null && judgment.outcome === 'correctly-rejected' && ids) {
       const eventsRoute = root + '/steps/' + ids.step.proOpeStepId + '/data/' + ids.point.proStepDataId + '/events';
       const listed = await call(action.id + '-history-after', 'GET', eventsRoute);
       const historyAfter = listed.status >= 200 && listed.status < 300 ? JSON.stringify(listed.data?.events ?? []) : null;
-      if (historyAfter == null || historyAfter !== historyBefore) {
+      historyUnchanged = historyAfter != null && historyAfter === historyBefore;
+      if (!historyUnchanged) {
         judgment = { outcome: 'invariant', finding: true, invariant: 'rejected request changed capture history' };
       }
     }
     note(action, judgment, true);
+    remember(action, {
+      seqs: response.seq == null ? [] : [response.seq],
+      status: response.status, method, route, body, errorText: errorText(response.data),
+      outcome: judgment.outcome, invariant: judgment.invariant, before, after, historyUnchanged,
+    });
     if (judgment.finding) {
       findings.push(finding(base, action, {
         action: response.seq,
@@ -262,6 +302,11 @@ export async function runDataCapture({ call, readDetail, scenario, catalog, orde
           expected: action.oracle, before, after, invariant: judgment.invariant,
         }));
       }
+      remember(action, {
+        seqs: responses.map((item) => item.seq).filter((seq) => seq != null),
+        status, method: 'PATCH', route, body: action.parallel.map((item) => item.body),
+        outcome: judgment.outcome, invariant: judgment.invariant, before, after,
+      });
       continue;
     }
     await runOne(action, action.body, action.oracle);
@@ -273,6 +318,7 @@ export async function runDataCapture({ call, readDetail, scenario, catalog, orde
     counters,
     findings,
     concurrency,
+    proofs,
     capturePlanHash: plan.capturePlanHash,
     locator: plan.steps.find((action) => action.category === 'numeric')?.locator ?? null,
   };

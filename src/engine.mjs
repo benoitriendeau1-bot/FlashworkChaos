@@ -203,6 +203,12 @@ export function instructionBlocksBody(text) {
   };
 }
 
+/** Round-trip form of an instruction. Line endings become LF and only the end of the string is trimmed. */
+export function normalizeInstructionText(value) {
+  if (typeof value !== 'string') return '';
+  return value.replace(/\r\n?/g, '\n').trimEnd();
+}
+
 const NUMERIC_SPECS = [
   { label: 'Fastener torque', minValue: 12, maxValue: 18, nominalValue: 15 },
   { label: 'Flange gap', minValue: 0.05, maxValue: 0.3, nominalValue: 0.15 },
@@ -242,20 +248,29 @@ export function dataPointBody(stepId, seq) {
   };
 }
 
-function stepTexts(step) {
-  const texts = [];
-  if (typeof step.stepDescription === 'string' && step.stepDescription.trim()) texts.push(step.stepDescription.trim());
-  for (const block of step.blocks ?? []) {
-    const rows = block?.contentJson?.rows ?? [];
-    for (const row of rows) for (const child of row?.blocks ?? []) {
+function blockInstructionText(block) {
+  const parts = [];
+  for (const row of block?.contentJson?.rows ?? []) {
+    for (const child of row?.blocks ?? []) {
       for (const node of child?.docJson?.content ?? []) {
         for (const span of node?.content ?? []) {
-          if (typeof span?.text === 'string' && span.text.trim()) texts.push(span.text.trim());
+          if (typeof span?.text === 'string') parts.push(span.text);
         }
       }
     }
   }
-  return texts;
+  return normalizeInstructionText(parts.join(''));
+}
+
+function stepTexts(step) {
+  const blocks = [];
+  for (const block of step?.blocks ?? []) {
+    const text = blockInstructionText(block);
+    if (text) blocks.push(text);
+  }
+  if (blocks.length > 0) return blocks;
+  const description = normalizeInstructionText(step?.stepDescription ?? '');
+  return description ? [description] : [];
 }
 
 export function snapshotFacts(detail) {
@@ -428,7 +443,7 @@ export function workOrderGaps(masterDetail, workOrderDetail) {
   }
   for (const step of master.steps) {
     const mirroredText = snapshot.steps.find((candidate) => candidate.operationNo === step.operationNo && String(candidate.stepNo) === String(step.stepNo));
-    if (step.texts.some((text) => text.length > 0) && !step.texts.every((text) => (mirroredText?.texts ?? []).some((found) => found.includes(text)))) {
+    if (step.texts.some((text) => text.length > 0) && !step.texts.every((text) => (mirroredText?.texts ?? []).some((found) => found === text))) {
       gaps.push({ level: 'workOrder', reason: 'snapshot missing work instruction', ids: { workOrderId, operationNo: step.operationNo, stepNo: step.stepNo } });
     }
     const mirrored = snapshot.steps.find((candidate) => candidate.operationNo === step.operationNo && String(candidate.stepNo) === String(step.stepNo));

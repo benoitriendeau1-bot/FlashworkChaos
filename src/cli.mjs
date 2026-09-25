@@ -27,6 +27,8 @@ import { runPlan, summarizeRunPlan } from './run-plan.mjs';
 import { runRunCapture } from './run-run.mjs';
 import { serviceVisitPlan, summarizeServiceVisitPlan } from './service-visit-plan.mjs';
 import { runServiceVisitCapture } from './service-visit-run.mjs';
+import { ensureChaosSignOffReasons } from './sign-off-reason-bootstrap.mjs';
+import { writeRunCoverage } from './coverage.mjs';
 import path from 'node:path';
 
 const arg = (name, fallback) => {
@@ -100,9 +102,17 @@ const bound = bindPlan(compiled, { prefix, runId });
 const output = reportWriter(path.resolve('runs', runId), seed);
 let reportClosed = false;
 function closeReport(summary) {
-  if (reportClosed) return;
+  if (reportClosed) return Promise.resolve();
   reportClosed = true;
   output.finish(summary);
+  return writeRunCoverage({
+    directory: path.dirname(output.file),
+    summary,
+    scenario: bound.scenarios[0] ?? null,
+    proofs: captureReport?.proofs ?? [],
+  }).catch((error) => {
+    console.error('Chaos coverage harness_error: ' + (error instanceof Error ? error.message : String(error)));
+  });
 }
 function fatalReport(error) {
   const text = error instanceof Error ? (error.stack || error.message) : String(error);
@@ -113,14 +123,17 @@ function fatalReport(error) {
     pass: false,
     error: text,
   };
+  let pending = Promise.resolve();
   try {
     output.write({ label: 'FATAL', seed, runId, prefix, error: text });
-    closeReport(summary);
+    pending = closeReport(summary);
   } catch (writeError) {
     console.error(writeError);
   }
-  console.error(text);
-  process.exit(1);
+  Promise.resolve(pending).finally(() => {
+    console.error(text);
+    process.exit(1);
+  });
 }
 process.on('unhandledRejection', fatalReport);
 process.on('uncaughtException', fatalReport);
@@ -159,6 +172,30 @@ function requiredId(result, keys, label) {
 
 const quotaGaps = [];
 let captureReport = null;
+const signOffReasons = await ensureChaosSignOffReasons(async (method, route, body) => {
+  const seq = ++action;
+  try {
+    const result = await api.call(method, route, body);
+    output.write({
+      seq, label: 'bootstrap sign-off reason', method, route, body: body ?? null,
+      status: result.status, response: result.data, phase: 'bootstrap',
+    });
+    return result;
+  } catch (error) {
+    output.write({
+      seq, label: 'bootstrap sign-off reason', method, route, body: body ?? null,
+      error: String(error), phase: 'bootstrap',
+    });
+    return { status: 0, data: { error: String(error) } };
+  }
+});
+if (!signOffReasons.ok) {
+  const detail = [signOffReasons.skip, signOffReasons.reopen]
+    .filter((item) => !item.ok)
+    .map((item) => item.reasonCode + ': ' + item.error)
+    .join('; ');
+  throw new Error('Chaos setup could not establish an active sign-off reason: ' + detail);
+}
 const differences = [];
 const masterReads = [];
 const workOrderReads = [];
@@ -509,6 +546,8 @@ if (signoffIds.operator || signoffIds.inspector) {
       }
     },
     seed, runId, prefix, effectivityDate, envUserId: user,
+    skipReasonId: signOffReasons.skip.id,
+    reopenReasonId: signOffReasons.reopen.id,
   });
 }
 let lifecycleReport = null;
@@ -537,6 +576,8 @@ lifecycleReport = await runLifecycle({
   },
   seed, runId, prefix, effectivityDate, envUserId: user,
   foreignOrderNo: bound.scenarios[0]?.orderNo ?? null,
+  skipReasonId: signOffReasons.skip.id,
+  reopenReasonId: signOffReasons.reopen.id,
 });
 let andonReport = null;
 andonReport = await runAndonCapture({
@@ -589,6 +630,8 @@ ncrReport = await runNcrCapture({
     }
   },
   seed, runId, prefix, effectivityDate, envUserId: user,
+  skipReasonId: signOffReasons.skip.id,
+  reopenReasonId: signOffReasons.reopen.id,
 });
 let varianceReport = null;
 varianceReport = await runVarianceCapture({
@@ -702,6 +745,20 @@ const summary = {
   observed,
   differences,
   execution: { effectivityDate },
+  signOffReasons: {
+    skip: {
+      reasonCode: signOffReasons.skip.reasonCode,
+      signOffSkipReasonId: signOffReasons.skip.id,
+      disposition: signOffReasons.skip.disposition,
+      isActive: true,
+    },
+    reopen: {
+      reasonCode: signOffReasons.reopen.reasonCode,
+      signOffReopenReasonId: signOffReasons.reopen.id,
+      disposition: signOffReasons.reopen.disposition,
+      isActive: true,
+    },
+  },
   capture: captureReport ? {
     locator: captureReport.locator ?? null,
     dataTypes: captureReport.dataTypes ?? null,

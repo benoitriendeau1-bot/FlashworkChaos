@@ -59,6 +59,7 @@ function readOrder(data) {
 
 export async function runLifecycle(input) {
   const plan = bindLifecyclePlan(lifecyclePlan(input.seed), input.runId);
+  if (!input.skipReasonId || !input.reopenReasonId) return blockedReport(plan, 'chaos skip or reopen reason was not established');
   const { setup, call } = input;
   const counters = emptyLifecycleCounters();
   counters.plannedActions = plan.actions.length + plan.races.length * plan.raceRepeats;
@@ -216,10 +217,8 @@ export async function runLifecycle(input) {
     actor = match?.userId ?? null;
   }
   if (!actor) return blockedReport(plan, 'lifecycle actor was not resolved');
-  const skipReasons = listOf((await call('list skip reasons', 'GET', '/sign-off-skip-reasons')).data, 'reasons');
-  const reopenReasons = listOf((await call('list reopen reasons', 'GET', '/sign-off-reopen-reasons')).data, 'reasons');
-  const skipReasonId = skipReasons.find((reason) => reason.active !== false)?.signOffSkipReasonId ?? skipReasons[0]?.id ?? null;
-  const reopenReasonId = reopenReasons.find((reason) => reason.active !== false)?.signOffReopenReasonId ?? reopenReasons[0]?.id ?? null;
+  const skipReasonId = input.skipReasonId;
+  const reopenReasonId = input.reopenReasonId;
 
   async function loadOrder() {
     const result = await call('read lifecycle PO', 'GET', orderRoot);

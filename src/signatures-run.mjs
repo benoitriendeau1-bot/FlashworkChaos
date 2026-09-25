@@ -108,8 +108,10 @@ function normalizeSignoff(row) {
 
 export async function runSignaturesCapture({
   setup, call, seed, runId, prefix, effectivityDate, envUserId,
+  skipReasonId, reopenReasonId,
 }) {
   const plan = bindSignaturesPlan(signaturesCapturePlan(seed), runId);
+  if (!skipReasonId || !reopenReasonId) return blockedReport(plan, 'chaos skip or reopen reason was not established');
   const token = String(runId).replaceAll('-', '').toUpperCase().slice(0, 12);
   const masterItemNo = 'MI-' + prefix + token + 'SIG';
   const orderNo = 'PO' + prefix + token + 'S1';
@@ -372,12 +374,7 @@ export async function runSignaturesCapture({
     if (found.signoff.outcome) return blockedReport(plan, 'sign-off ' + slot.key + ' is not pending in the snapshot');
   }
 
-  const skipList = await setup('list skip reasons', 'GET', '/sign-off-skip-reasons');
-  const reopenList = await setup('list reopen reasons', 'GET', '/sign-off-reopen-reasons');
-  const reasons = {
-    skip: listOf(skipList.data, 'reasons')[0]?.signOffSkipReasonId ?? null,
-    reopen: listOf(reopenList.data, 'reasons')[0]?.signOffReopenReasonId ?? null,
-  };
+  const reasons = { skip: skipReasonId, reopen: reopenReasonId };
   const counters = emptySignatureCounters();
   for (const action of plan.actions) (counters[action.action] ?? counters.pass).plannedActions++;
   const findings = [];

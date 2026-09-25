@@ -48,6 +48,19 @@ Chaque requête est ajoutée à `runs/<run-id>/events.jsonl`. Le verdict est `ru
 
 Si le processus s’arrête avant le résumé normal, un `summary.json` avec `fatal: true` est écrit dès qu’une erreur non gérée survient après l’ouverture du journal. Il contient le seed, le run-id, le préfixe, le hash de manufacturing et la pile. L’identifiant reste consommé si des objets ont été créés. Lire la fin de `events.jsonl` et ce résumé, puis reprendre avec un nouvel identifiant.
 
+La couverture action par action est décrite dans `docs/coverage-dashboard.md`. `npm run coverage -- --run-id=<id>` reconstruit `coverage.json` et `coverage.md` sans appel HTTP.
+
+Le dashboard local se consulte sans démarrer FlashWork :
+
+```powershell
+npm --prefix dashboard/web install
+npm run dashboard
+```
+
+L’installation des paquets Vue et Vite se fait une fois, dans `dashboard/web`. Ensuite `npm run dashboard` construit l’interface et ouvre `http://127.0.0.1:4173`. Le serveur ne démarre pas de seed, n’écrit pas dans `runs/` et n’appelle pas le backend.
+
+`npm run dashboard:dev` lance l’API sur le port 4174 et Vite sur `http://127.0.0.1:4173`, avec le proxy `/api`. `npm run dashboard:server` sert l’API et le build déjà produit. `npm run dashboard:build` ne fait que la construction. Le détail des écrans, des filtres et de `not_proved` est dans `docs/coverage-dashboard.md`.
+
 ## Drapeaux
 
 `pass` est la conjonction de toutes les tranches. Une tranche a en général `capturePass` et `chaosPass`.

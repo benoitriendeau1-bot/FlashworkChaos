@@ -43,7 +43,7 @@ export function hasOperation(detail, operationNo) {
   return operationNumbers(detail).includes(String(operationNo));
 }
 
-function oracleAction(action) {
+export function oracleAction(action) {
   if (action.label === 'second-draft') {
     const next = { ...action, http: 409, code: 'WORK_ORDER_VARIANCE_DRAFT_EXISTS' };
     delete next.errorIncludes;

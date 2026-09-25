@@ -94,6 +94,9 @@ export async function runNcrCapture(input) {
     findings: [{ severity: 'high', invariant: reason }],
     contractDecisions, notApplicable, concurrency, blocked: [{ id: 'setup', reason }],
   });
+  if (!input.skipReasonId || !input.reopenReasonId) return blockedReport('chaos skip or reopen reason was not established');
+  const skipReasonId = input.skipReasonId;
+  const reopenReasonId = input.reopenReasonId;
 
   const known = ['SIG', 'SIGS', 'SIGL', 'SIGO', 'OBS', 'REQ', 'OPT', 'INF', 'NN', 'SE', 'LO', 'LC', 'AND'];
   if (known.some((suffix) => plan.partNumber.endsWith(suffix) || plan.toolNumber.endsWith(suffix))) {
@@ -224,10 +227,6 @@ export async function runNcrCapture(input) {
 
   const users = await call('list ncr users', 'GET', '/admin/users');
   const secondary = listOf(users.data, 'users').map((user) => user.userId).find((id) => id && id !== envUserId) ?? envUserId;
-  const skipReasons = listOf((await call('list ncr skip reasons', 'GET', '/sign-off-skip-reasons')).data, 'reasons');
-  const reopenReasons = listOf((await call('list ncr reopen reasons', 'GET', '/sign-off-reopen-reasons')).data, 'reasons');
-  const skipReasonId = skipReasons.find((reason) => reason.active !== false)?.signOffSkipReasonId ?? null;
-  const reopenReasonId = reopenReasons.find((reason) => reason.active !== false)?.signOffReopenReasonId ?? null;
 
   function wo(unit) {
     return workOrders.find((item) => item.unit === unit);

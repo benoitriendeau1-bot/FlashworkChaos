@@ -6,7 +6,12 @@
   "scripts": {
     "test": "node --test",
     "plan": "node src/cli.mjs --dry-run",
-    "start": "node src/cli.mjs"
+    "start": "node src/cli.mjs",
+    "coverage": "node src/coverage-cli.mjs",
+    "dashboard:build": "npm --prefix dashboard/web run build",
+    "dashboard:server": "node dashboard/server/index.mjs",
+    "dashboard:dev": "node dashboard/server/dev.mjs",
+    "dashboard": "npm run dashboard:build && npm run dashboard:server"
   },
   "engines": {
     "node": ">=20"
